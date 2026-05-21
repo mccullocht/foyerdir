@@ -1,0 +1,8 @@
+[package]
+name = "foyerdir"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "foyerdir"
+crate-type = ["cdylib"]
