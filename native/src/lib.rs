@@ -18,6 +18,7 @@ pub struct FoyerDirectory {
     dir_file: File,
     cache: foyer::Cache<CacheKey, Box<[u8]>>,
     page_size: usize,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl FoyerDirectory {
@@ -28,11 +29,19 @@ impl FoyerDirectory {
                 std::mem::size_of::<CacheKey>() + value.len()
             })
             .build();
+        let num_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .max_blocking_threads(num_cores)
+            .build()?;
         Ok(Self {
             path,
             dir_file,
             cache,
             page_size: page_size as usize,
+            runtime,
         })
     }
 

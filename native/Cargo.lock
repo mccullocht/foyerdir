@@ -233,6 +233,7 @@ name = "foyerdir"
 version = "0.1.0"
 dependencies = [
  "foyer",
+ "tokio",
 ]
 
 [[package]]
