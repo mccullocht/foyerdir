@@ -26,6 +26,7 @@ public final class FoyerDirectory extends BaseDirectory {
     private static final MethodHandle VERSION;
     private static final MethodHandle OPEN_DIRECTORY;
     private static final MethodHandle CLOSE_DIRECTORY;
+    private static final MethodHandle SYNC_DIRECTORY;
 
     private final Path path;
     private final Arena arena;
@@ -48,6 +49,9 @@ public final class FoyerDirectory extends BaseDirectory {
                             ValueLayout.JAVA_INT));
             CLOSE_DIRECTORY = linker.downcallHandle(
                     symbols.findOrThrow("foyer_close_directory"),
+                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+            SYNC_DIRECTORY = linker.downcallHandle(
+                    symbols.findOrThrow("foyer_directory_sync"),
                     FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
         } catch (Exception e) {
             throw new ExceptionInInitializerError(e);
@@ -119,12 +123,19 @@ public final class FoyerDirectory extends BaseDirectory {
 
     @Override
     public void sync(Collection<String> names) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        // NB: files will be synced before close, and if sync fails we will crash.
+        syncMetaData();
     }
 
     @Override
     public void syncMetaData() throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        try {
+            SYNC_DIRECTORY.invokeExact(nativeHandle);
+        } catch (Throwable t) {
+            if (t instanceof IOException ioe) throw ioe;
+            throw new IOException(t);
+        }
     }
 
     @Override

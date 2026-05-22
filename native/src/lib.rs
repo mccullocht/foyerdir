@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,22 +15,29 @@ struct CacheKey {
 /// forces us to handle IO details to provide read-through and write-through cache.
 pub struct FoyerDirectory {
     path: PathBuf,
+    dir_file: File,
     cache: foyer::Cache<CacheKey, Box<[u8]>>,
     page_size: usize,
 }
 
 impl FoyerDirectory {
-    fn new(path: PathBuf, cache_size: u64, page_size: u32) -> Self {
+    fn new(path: PathBuf, cache_size: u64, page_size: u32) -> io::Result<Self> {
+        let dir_file = File::open(&path)?;
         let cache = foyer::CacheBuilder::new(cache_size as usize)
             .with_weighter(|_key: &CacheKey, value: &Box<[u8]>| {
                 std::mem::size_of::<CacheKey>() + value.len()
             })
             .build();
-        Self {
+        Ok(Self {
             path,
+            dir_file,
             cache,
             page_size: page_size as usize,
-        }
+        })
+    }
+
+    fn sync_metadata(&self) -> io::Result<()> {
+        self.dir_file.sync_all()
     }
 }
 
@@ -48,10 +57,19 @@ pub unsafe extern "C" fn foyer_open_directory(
     let path_bytes = unsafe { std::slice::from_raw_parts(path, path_len as usize) };
     let path = PathBuf::from(std::str::from_utf8(path_bytes).unwrap());
     let page_size = 1u32 << log_page_size;
-    Arc::into_raw(Arc::new(FoyerDirectory::new(path, cache_bytes, page_size)))
+    Arc::into_raw(Arc::new(
+        FoyerDirectory::new(path, cache_bytes, page_size).unwrap(),
+    ))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn foyer_close_directory(dir: *const FoyerDirectory) {
     let _ = unsafe { Arc::from_raw(dir) };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn foyer_directory_sync(dir: *const FoyerDirectory) {
+    let dir = unsafe { &*dir };
+    dir.sync_metadata()
+        .expect("by policy, crash if sync fails.");
 }
