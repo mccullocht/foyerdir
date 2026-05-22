@@ -6,3 +6,6 @@ edition = "2024"
 [lib]
 name = "foyerdir"
 crate-type = ["cdylib"]
+
+[dependencies]
+foyer = "0.22.3"
