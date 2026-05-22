@@ -1,5 +1,6 @@
 package com.github.mccullocht.foyerdir;
 
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -9,26 +10,34 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.lucene.store.BaseDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.NativeFSLockFactory;
+import org.apache.lucene.store.OutputStreamIndexOutput;
 
 public final class FoyerDirectory extends BaseDirectory {
+    private static final int CHUNK_SIZE = 8192;
     private static final MethodHandle VERSION;
     private static final MethodHandle OPEN_DIRECTORY;
     private static final MethodHandle CLOSE_DIRECTORY;
     private static final MethodHandle SYNC_DIRECTORY;
 
     private final Path path;
+    private final AtomicLong nextTempFileCounter = new AtomicLong();
+
     private final Arena arena;
     private final MemorySegment nativeHandle;
 
@@ -64,10 +73,15 @@ public final class FoyerDirectory extends BaseDirectory {
      * <p>Data is persisted into a directory at {@code path}, which will be created if it does not
      * exist. The cache will be maintained at no more than {@code cacheBytes}. Each file will be
      * cached in units of up to {@code 1 << logPageSize} bytes.
+     * 
+     * <p>{@code logPageSize} must be >= 12.
      */
     public FoyerDirectory(Path path, long cacheBytes, int logPageSize) throws IOException {
         super(NativeFSLockFactory.INSTANCE);
         this.path = path;
+        if (logPageSize < 12) {
+            throw new IllegalArgumentException("logPageSize must be at least 12");
+        }
         Files.createDirectories(path);
         this.arena = Arena.ofShared();
         byte[] pathBytes = path.toString().getBytes(StandardCharsets.UTF_8);
@@ -113,12 +127,40 @@ public final class FoyerDirectory extends BaseDirectory {
 
     @Override
     public IndexOutput createOutput(String name, IOContext context) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        return newIndexOutput(name, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
     }
 
     @Override
     public IndexOutput createTempOutput(String prefix, String suffix, IOContext context) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        while (true) {
+            try {
+                String name = getTempFileName(prefix, suffix, nextTempFileCounter.getAndIncrement());
+                return newIndexOutput(name, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
+            } catch (@SuppressWarnings("unused") FileAlreadyExistsException faee) {
+                // Retry with next incremented name
+            }
+        }
+    }
+
+    private OutputStreamIndexOutput newIndexOutput(String name, OpenOption... options) throws IOException {
+        Path file = path.resolve(name);
+        return new OutputStreamIndexOutput(
+                "FoyerIndexOutput(path=\"" + file + "\")",
+                name,
+                new FilterOutputStream(Files.newOutputStream(file, options)) {
+                    @Override
+                    public void write(byte[] b, int offset, int length) throws IOException {
+                        while (length > 0) {
+                            int chunk = Math.min(length, CHUNK_SIZE);
+                            out.write(b, offset, chunk);
+                            length -= chunk;
+                            offset += chunk;
+                        }
+                    }
+                },
+                CHUNK_SIZE);
     }
 
     @Override

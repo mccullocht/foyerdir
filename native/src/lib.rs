@@ -64,7 +64,10 @@ pub unsafe extern "C" fn foyer_open_directory(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn foyer_close_directory(dir: *const FoyerDirectory) {
-    let _ = unsafe { Arc::from_raw(dir) };
+    let dir = unsafe { Arc::from_raw(dir) };
+    if Arc::strong_count(&dir) > 1 {
+        eprintln!("Closing directory with open files!");
+    }
 }
 
 #[unsafe(no_mangle)]
