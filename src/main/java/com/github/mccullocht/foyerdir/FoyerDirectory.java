@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Set;
 
 import org.apache.lucene.store.BaseDirectory;
@@ -22,6 +23,8 @@ import org.apache.lucene.store.NativeFSLockFactory;
 public final class FoyerDirectory extends BaseDirectory {
     private static final SymbolLookup SYMBOLS;
 
+    private final Path path;
+
     static {
         try {
             SYMBOLS = loadNativeLibrary();
@@ -30,8 +33,10 @@ public final class FoyerDirectory extends BaseDirectory {
         }
     }
 
-    public FoyerDirectory() {
+    public FoyerDirectory(Path path) throws IOException {
         super(NativeFSLockFactory.INSTANCE);
+        this.path = path;
+        Files.createDirectories(path);
     }
 
     public static int version() throws Throwable {
@@ -44,17 +49,26 @@ public final class FoyerDirectory extends BaseDirectory {
 
     @Override
     public String[] listAll() throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        try (var stream = Files.list(path)) {
+            return stream
+                    .filter(p -> !Files.isDirectory(p))
+                    .map(p -> p.getFileName().toString())
+                    .sorted()
+                    .toArray(String[]::new);
+        }
     }
 
     @Override
     public void deleteFile(String name) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        Files.delete(path.resolve(name));
     }
 
     @Override
     public long fileLength(String name) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        return Files.size(path.resolve(name));
     }
 
     @Override
@@ -79,7 +93,8 @@ public final class FoyerDirectory extends BaseDirectory {
 
     @Override
     public void rename(String source, String dest) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        Files.move(path.resolve(source), path.resolve(dest), StandardCopyOption.ATOMIC_MOVE);
     }
 
     @Override
@@ -89,11 +104,12 @@ public final class FoyerDirectory extends BaseDirectory {
 
     @Override
     public Set<String> getPendingDeletions() throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        return Collections.emptySet();
     }
 
     @Override
     public void close() throws IOException {
+        this.isOpen = false;
         throw new UnsupportedOperationException("unimplemented");
     }
 
@@ -105,8 +121,6 @@ public final class FoyerDirectory extends BaseDirectory {
             classifier = arch.equals("aarch64") ? "darwin-aarch64" : "darwin-x86_64";
         } else if (os.startsWith("linux")) {
             classifier = arch.equals("aarch64") ? "linux-aarch64" : "linux-x86_64";
-        } else if (os.startsWith("win")) {
-            classifier = "windows-x86_64";
         } else {
             throw new UnsatisfiedLinkError("Unsupported platform: " + os + " " + arch);
         }
