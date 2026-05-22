@@ -9,4 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 foyer = "0.22.3"
+libc = "0.2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
