@@ -7,6 +7,9 @@ edition = "2024"
 name = "foyerdir"
 crate-type = ["cdylib"]
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 crc = "3.4.0"
 foyer = "0.22.3"
