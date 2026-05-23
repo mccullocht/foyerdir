@@ -52,8 +52,7 @@ public final class FoyerDirectory extends BaseDirectory {
                     symbols.findOrThrow("foyer_open_directory"),
                     FunctionDescriptor.of(
                             ValueLayout.ADDRESS,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_INT,
                             ValueLayout.JAVA_LONG,
                             ValueLayout.JAVA_INT));
             CLOSE_DIRECTORY = linker.downcallHandle(
@@ -94,6 +93,7 @@ public final class FoyerDirectory extends BaseDirectory {
             this.arena.close();
             if (t instanceof IOException ioe) throw ioe;
             throw new IOException(t);
+                
         }
     }
 
@@ -177,6 +177,7 @@ public final class FoyerDirectory extends BaseDirectory {
         } catch (Throwable t) {
             if (t instanceof IOException ioe) throw ioe;
             throw new IOException(t);
+                
         }
     }
 
@@ -205,6 +206,7 @@ public final class FoyerDirectory extends BaseDirectory {
         } catch (Throwable t) {
             if (t instanceof IOException ioe) throw ioe;
             throw new IOException(t);
+                
         } finally {
             arena.close();
         }

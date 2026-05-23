@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
 use crc::{CRC_32_ISO_HDLC, Crc, Digest, Table};
@@ -25,7 +26,7 @@ pub struct FoyerDirectory {
     cache: foyer::Cache<CacheKey, Box<[u8]>>,
     page_size: usize,
     runtime: tokio::runtime::Runtime,
-    file_ids: RwLock<HashMap<PathBuf, usize>>,
+    file_ids: FileIdMap,
 }
 
 impl FoyerDirectory {
@@ -49,7 +50,7 @@ impl FoyerDirectory {
             cache,
             page_size,
             runtime,
-            file_ids: RwLock::default(),
+            file_ids: FileIdMap::default(),
         })
     }
 
@@ -57,13 +58,49 @@ impl FoyerDirectory {
         self.dir_file.sync_all()
     }
 
+    // TODO(FFI): wire into Directory.delete().
+    fn delete_file_id(&self, relative_path: &Path) {
+        self.file_ids.remove(relative_path);
+    }
+
+    // TODO(FFI): wire into Directory.open_output().
     fn new_output(self: &Arc<Self>, relative_path: &Path) -> io::Result<FoyerIndexOutput> {
         let path = self.path.join(relative_path);
-        // TODO: file_ids grows without bounds so fix that.
-        let mut file_ids = self.file_ids.write().expect("not poisoned");
-        let next = file_ids.len();
-        let entry = file_ids.entry(path).insert_entry(next);
-        FoyerIndexOutput::new(Arc::clone(self), entry.key(), *entry.get(), self.page_size)
+        FoyerIndexOutput::new(
+            Arc::clone(self),
+            &self.path.join(relative_path),
+            self.file_ids.get_output(relative_path),
+            self.page_size,
+        )
+    }
+}
+
+#[derive(Default)]
+struct FileIdMap {
+    map: RwLock<HashMap<PathBuf, usize>>,
+    next: AtomicUsize,
+}
+
+impl FileIdMap {
+    fn get_input(&self, relative_path: &Path) -> usize {
+        {
+            let m = self.map.read().expect("poison");
+            if let Some(id) = m.get(relative_path) {
+                return *id;
+            }
+        }
+        self.get_output(relative_path)
+    }
+
+    fn get_output(&self, relative_path: &Path) -> usize {
+        let mut m = self.map.write().expect("poison");
+        *m.entry(relative_path.to_owned())
+            .or_insert_with(|| self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn remove(&self, relative_path: &Path) {
+        let mut m = self.map.write().expect("poison");
+        m.remove(relative_path);
     }
 }
 
@@ -286,6 +323,65 @@ impl FoyerIndexOutput {
     }
 }
 
+mod ffi {
+    use super::*;
+
+    fn path_from_ptr<'a>(p: *const u8, len: u32) -> &'a Path {
+        Path::new(
+            std::str::from_utf8(unsafe { std::slice::from_raw_parts::<'a, _>(p, len as usize) })
+                .expect("valid utf8"),
+        )
+    }
+
+    /// Returns the library version as a u32.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyerdir_version() -> u32 {
+        1
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_open_directory(
+        path: *const u8,
+        path_len: u32,
+        cache_bytes: u64,
+        log_page_size: i32,
+    ) -> *const FoyerDirectory {
+        let path = path_from_ptr(path, path_len);
+        let page_size = 1usize << log_page_size;
+        Arc::into_raw(Arc::new(
+            FoyerDirectory::new(path.to_owned(), cache_bytes, page_size).unwrap(),
+        ))
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_close_directory(dir: *const FoyerDirectory) {
+        let dir = unsafe { Arc::from_raw(dir) };
+        if Arc::strong_count(&dir) > 1 {
+            eprintln!("Closing directory with open files!");
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_directory_sync(dir: *const FoyerDirectory) {
+        let dir = unsafe { &*dir };
+        dir.sync_metadata()
+            .expect("by policy, crash if sync fails.");
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_directory_delete_file_id(
+        dir: *const FoyerDirectory,
+        relative_path: *const u8,
+        len: u32,
+    ) {
+        // NB: caller holds a reference.
+        let dir = unsafe { Arc::from_raw(dir) };
+        let relative_path = path_from_ptr(relative_path, len);
+        dir.delete_file_id(relative_path);
+        Arc::into_raw(dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,40 +541,4 @@ mod tests {
         let out = dir.new_output(Path::new("test.bin")).unwrap();
         out.close(&vec![0u8; PAGE_SIZE], PAGE_SIZE).unwrap();
     }
-}
-
-/// Returns the library version as a u32.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn foyerdir_version() -> u32 {
-    1
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn foyer_open_directory(
-    path: *const u8,
-    path_len: u64,
-    cache_bytes: u64,
-    log_page_size: i32,
-) -> *const FoyerDirectory {
-    let path_bytes = unsafe { std::slice::from_raw_parts(path, path_len as usize) };
-    let path = PathBuf::from(std::str::from_utf8(path_bytes).unwrap());
-    let page_size = 1usize << log_page_size;
-    Arc::into_raw(Arc::new(
-        FoyerDirectory::new(path, cache_bytes, page_size).unwrap(),
-    ))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn foyer_close_directory(dir: *const FoyerDirectory) {
-    let dir = unsafe { Arc::from_raw(dir) };
-    if Arc::strong_count(&dir) > 1 {
-        eprintln!("Closing directory with open files!");
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn foyer_directory_sync(dir: *const FoyerDirectory) {
-    let dir = unsafe { &*dir };
-    dir.sync_metadata()
-        .expect("by policy, crash if sync fails.");
 }
