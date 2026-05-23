@@ -1,10 +1,11 @@
 // XXX remove.
 #![allow(unused)]
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crc::{CRC_32_ISO_HDLC, Crc, Digest, Table};
 
@@ -24,6 +25,7 @@ pub struct FoyerDirectory {
     cache: foyer::Cache<CacheKey, Box<[u8]>>,
     page_size: usize,
     runtime: tokio::runtime::Runtime,
+    file_ids: RwLock<HashMap<PathBuf, usize>>,
 }
 
 impl FoyerDirectory {
@@ -47,11 +49,21 @@ impl FoyerDirectory {
             cache,
             page_size,
             runtime,
+            file_ids: RwLock::default(),
         })
     }
 
     fn sync_metadata(&self) -> io::Result<()> {
         self.dir_file.sync_all()
+    }
+
+    fn new_output(self: &Arc<Self>, relative_path: &Path) -> io::Result<FoyerIndexOutput> {
+        let path = self.path.join(relative_path);
+        // TODO: file_ids grows without bounds so fix that.
+        let mut file_ids = self.file_ids.write().expect("not poisoned");
+        let next = file_ids.len();
+        let entry = file_ids.entry(path).insert_entry(next);
+        FoyerIndexOutput::new(Arc::clone(self), entry.key(), *entry.get(), self.page_size)
     }
 }
 
@@ -285,15 +297,11 @@ mod tests {
         Arc::new(FoyerDirectory::new(tmp.path().to_path_buf(), 1 << 20, PAGE_SIZE).unwrap())
     }
 
-    fn make_output(dir: Arc<FoyerDirectory>, tmp: &TempDir, name: &str) -> FoyerIndexOutput {
-        FoyerIndexOutput::new(dir, &tmp.path().join(name), 0, PAGE_SIZE).unwrap()
-    }
-
     #[test]
     fn write_page_persists_bytes() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(dir, &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         let page: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
         out.write_page(&page).unwrap();
@@ -305,7 +313,7 @@ mod tests {
     fn write_multiple_pages_appends() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(dir, &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         let page0 = vec![0xAAu8; PAGE_SIZE];
         let page1 = vec![0xBBu8; PAGE_SIZE];
@@ -322,7 +330,7 @@ mod tests {
     fn checksum_over_written_pages() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(Arc::clone(&dir), &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         let page = vec![0x42u8; PAGE_SIZE];
         out.write_page(&page).unwrap();
@@ -334,7 +342,7 @@ mod tests {
     fn checksum_includes_buffered_bytes() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(Arc::clone(&dir), &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         let page = vec![0x11u8; PAGE_SIZE];
         let buffered = vec![0x22u8; 100];
@@ -349,7 +357,7 @@ mod tests {
     fn close_produces_exact_file_length() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(Arc::clone(&dir), &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         out.write_page(&vec![0xAAu8; PAGE_SIZE]).unwrap();
 
@@ -366,7 +374,7 @@ mod tests {
     fn close_writes_correct_content() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(Arc::clone(&dir), &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         let page: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
         out.write_page(&page).unwrap();
@@ -385,7 +393,7 @@ mod tests {
     fn close_only_partial_page() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let out = make_output(Arc::clone(&dir), &tmp, "test.bin");
+        let out = dir.new_output(Path::new("test.bin")).unwrap();
 
         let len = 200;
         out.close(&vec![0xCCu8; PAGE_SIZE], len).unwrap();
@@ -400,7 +408,7 @@ mod tests {
     fn close_zero_len_trims_to_full_pages() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(Arc::clone(&dir), &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
 
         out.write_page(&vec![0xAAu8; PAGE_SIZE]).unwrap();
         out.close(&vec![0xBBu8; PAGE_SIZE], 0).unwrap();
@@ -416,7 +424,7 @@ mod tests {
     fn write_page_panics_on_wrong_size() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let mut out = make_output(dir, &tmp, "test.bin");
+        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
         out.write_page(&[0u8; 512]).unwrap();
     }
 
@@ -425,7 +433,7 @@ mod tests {
     fn close_panics_on_wrong_page_size() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let out = make_output(dir, &tmp, "test.bin");
+        let out = dir.new_output(Path::new("test.bin")).unwrap();
         out.close(&[0u8; 512], 100).unwrap();
     }
 
@@ -434,7 +442,7 @@ mod tests {
     fn close_panics_when_len_equals_page_size() {
         let tmp = TempDir::new().unwrap();
         let dir = make_dir(&tmp);
-        let out = make_output(dir, &tmp, "test.bin");
+        let out = dir.new_output(Path::new("test.bin")).unwrap();
         out.close(&vec![0u8; PAGE_SIZE], PAGE_SIZE).unwrap();
     }
 }
