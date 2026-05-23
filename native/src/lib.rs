@@ -1,7 +1,12 @@
+// XXX remove.
+#![allow(unused)]
+
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crc::{CRC_32_ISO_HDLC, Crc, Digest, Table};
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
@@ -129,7 +134,6 @@ impl FoyerIndexInput {
         let len = out.len();
         let this = Arc::clone(self);
 
-        let handle = self.dir.runtime.enter();
         let entry = self
             .dir
             .runtime
@@ -159,6 +163,114 @@ impl FoyerIndexInput {
 
     fn len(&self) -> usize {
         self.file_len
+    }
+}
+
+/// Creates a write-only file, bypassing the kernel buffer cache.
+///
+/// On Linux this sets O_DIRECT at open time. On macOS it uses F_NOCACHE via fcntl, which
+/// is the only supported mechanism for disabling the buffer cache on that platform.
+fn create_direct(path: &Path) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .create(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let file = File::create(path)?;
+        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
+    }
+}
+
+const CRC: Crc<u32, Table<1>> = Crc::<u32, _>::new(&CRC_32_ISO_HDLC);
+
+pub struct FoyerIndexOutput {
+    dir: Arc<FoyerDirectory>,
+    file: File,
+    file_id: usize,
+    page: usize,
+    checksum: Digest<'static, u32, Table<1>>,
+    page_size: usize,
+}
+
+impl FoyerIndexOutput {
+    fn new(
+        dir: Arc<FoyerDirectory>,
+        path: &Path,
+        file_id: usize,
+        page_size: usize,
+    ) -> io::Result<Self> {
+        let file = create_direct(path)?;
+        Ok(Self {
+            dir,
+            file,
+            file_id,
+            page: 0,
+            checksum: CRC.digest(),
+            page_size,
+        })
+    }
+
+    /// Write a single page to the end of the file.
+    ///
+    /// *Panics* if page.len() does not match page size.
+    fn write_page(&mut self, page: &[u8]) -> io::Result<()> {
+        assert_eq!(page.len(), self.page_size);
+        self.file.write_all(page)?;
+        self.checksum.update(page);
+        let key = CacheKey {
+            file: self.file_id,
+            page: self.page,
+        };
+        self.dir.cache.insert(
+            CacheKey {
+                file: self.file_id,
+                page: self.page,
+            },
+            Box::from(page),
+        );
+        self.page += 1;
+        Ok(())
+    }
+
+    /// Return an ISO HDLC 32-bit CRC checksum of all of the file bytes written up to this point
+    /// plus any buffered bytes that have not been flushed.
+    fn checksum(&self, buffered: &[u8]) -> u32 {
+        let mut digest = self.checksum.clone();
+        digest.update(buffered);
+        digest.finalize()
+    }
+
+    /// Write a single page to the end of the file, keeping only len bytes, then flush the file and
+    /// close it.
+    ///
+    /// *Panics* if bytes.len() does not match page size.
+    fn close(mut self, page: &[u8], len: usize) -> io::Result<()> {
+        assert_eq!(page.len(), self.page_size);
+        assert!(len < self.page_size, "{len} {}", self.page_size);
+        self.file.write_all(page)?;
+        self.file
+            .set_len((self.page * self.page_size + len) as u64)?;
+        if let Err(e) = self.file.sync_all() {
+            panic!("Failed to flush file: {e}");
+        }
+        self.dir.cache.insert(
+            CacheKey {
+                file: self.file_id,
+                page: self.page,
+            },
+            Box::from(&page[..len]),
+        );
+        Ok(())
     }
 }
 

@@ -8,6 +8,7 @@ name = "foyerdir"
 crate-type = ["cdylib"]
 
 [dependencies]
+crc = "3.4.0"
 foyer = "0.22.3"
 libc = "0.2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
