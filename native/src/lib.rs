@@ -54,6 +54,10 @@ impl FoyerDirectory {
         })
     }
 
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn sync_metadata(&self) -> io::Result<()> {
         self.dir_file.sync_all()
     }
@@ -389,34 +393,45 @@ mod tests {
 
     const PAGE_SIZE: usize = 16384;
 
-    fn make_dir(tmp: &TempDir) -> Arc<FoyerDirectory> {
-        Arc::new(FoyerDirectory::new(tmp.path().to_path_buf(), 1 << 20, PAGE_SIZE).unwrap())
+    struct Fixture {
+        // dir must be declared before _tmp so it is dropped first, releasing
+        // the open directory fd before tempfile attempts to delete the path.
+        dir: Arc<FoyerDirectory>,
+        _tmp: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let dir = Arc::new(
+                FoyerDirectory::new(tmp.path().to_path_buf(), 1 << 20, PAGE_SIZE).unwrap(),
+            );
+            Self { dir, _tmp: tmp }
+        }
     }
 
     #[test]
     fn write_page_persists_bytes() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         let page: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
         out.write_page(&page).unwrap();
 
-        assert_eq!(std::fs::read(tmp.path().join("test.bin")).unwrap(), page);
+        assert_eq!(std::fs::read(f.dir.path().join("test.bin")).unwrap(), page);
     }
 
     #[test]
     fn write_multiple_pages_appends() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         let page0 = vec![0xAAu8; PAGE_SIZE];
         let page1 = vec![0xBBu8; PAGE_SIZE];
         out.write_page(&page0).unwrap();
         out.write_page(&page1).unwrap();
 
-        let bytes = std::fs::read(tmp.path().join("test.bin")).unwrap();
+        let bytes = std::fs::read(f.dir.path().join("test.bin")).unwrap();
         assert_eq!(bytes.len(), PAGE_SIZE * 2);
         assert_eq!(&bytes[..PAGE_SIZE], page0.as_slice());
         assert_eq!(&bytes[PAGE_SIZE..], page1.as_slice());
@@ -424,9 +439,8 @@ mod tests {
 
     #[test]
     fn checksum_over_written_pages() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         let page = vec![0x42u8; PAGE_SIZE];
         out.write_page(&page).unwrap();
@@ -436,9 +450,8 @@ mod tests {
 
     #[test]
     fn checksum_includes_buffered_bytes() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         let page = vec![0x11u8; PAGE_SIZE];
         let buffered = vec![0x22u8; 100];
@@ -451,26 +464,22 @@ mod tests {
 
     #[test]
     fn close_produces_exact_file_length() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         out.write_page(&vec![0xAAu8; PAGE_SIZE]).unwrap();
 
         let len = 137;
         out.close(&vec![0xBBu8; PAGE_SIZE], len).unwrap();
 
-        let file_len = std::fs::metadata(tmp.path().join("test.bin"))
-            .unwrap()
-            .len();
+        let file_len = std::fs::metadata(f.dir.path().join("test.bin")).unwrap().len();
         assert_eq!(file_len, (PAGE_SIZE + len) as u64);
     }
 
     #[test]
     fn close_writes_correct_content() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         let page: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
         out.write_page(&page).unwrap();
@@ -479,7 +488,7 @@ mod tests {
         let len = 512;
         out.close(&last_page, len).unwrap();
 
-        let bytes = std::fs::read(tmp.path().join("test.bin")).unwrap();
+        let bytes = std::fs::read(f.dir.path().join("test.bin")).unwrap();
         assert_eq!(bytes.len(), PAGE_SIZE + len);
         assert_eq!(&bytes[..PAGE_SIZE], page.as_slice());
         assert_eq!(&bytes[PAGE_SIZE..], &last_page[..len]);
@@ -487,58 +496,49 @@ mod tests {
 
     #[test]
     fn close_only_partial_page() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         let len = 200;
         out.close(&vec![0xCCu8; PAGE_SIZE], len).unwrap();
 
-        let file_len = std::fs::metadata(tmp.path().join("test.bin"))
-            .unwrap()
-            .len();
+        let file_len = std::fs::metadata(f.dir.path().join("test.bin")).unwrap().len();
         assert_eq!(file_len, len as u64);
     }
 
     #[test]
     fn close_zero_len_trims_to_full_pages() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
 
         out.write_page(&vec![0xAAu8; PAGE_SIZE]).unwrap();
         out.close(&vec![0xBBu8; PAGE_SIZE], 0).unwrap();
 
-        let file_len = std::fs::metadata(tmp.path().join("test.bin"))
-            .unwrap()
-            .len();
+        let file_len = std::fs::metadata(f.dir.path().join("test.bin")).unwrap().len();
         assert_eq!(file_len, PAGE_SIZE as u64);
     }
 
     #[test]
     #[should_panic]
     fn write_page_panics_on_wrong_size() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let mut out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
         out.write_page(&[0u8; 512]).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn close_panics_on_wrong_page_size() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let out = f.dir.new_output(Path::new("test.bin")).unwrap();
         out.close(&[0u8; 512], 100).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn close_panics_when_len_equals_page_size() {
-        let tmp = TempDir::new().unwrap();
-        let dir = make_dir(&tmp);
-        let out = dir.new_output(Path::new("test.bin")).unwrap();
+        let f = Fixture::new();
+        let out = f.dir.new_output(Path::new("test.bin")).unwrap();
         out.close(&vec![0u8; PAGE_SIZE], PAGE_SIZE).unwrap();
     }
 }
