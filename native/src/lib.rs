@@ -67,6 +67,16 @@ impl FoyerDirectory {
         self.file_ids.remove(relative_path);
     }
 
+    fn new_input(self: &Arc<Self>, relative_path: &Path) -> io::Result<Arc<FoyerIndexInput>> {
+        let path = self.path.join(relative_path);
+        FoyerIndexInput::new(
+            Arc::clone(self),
+            &path,
+            self.file_ids.get_input(relative_path),
+            self.page_size,
+        )
+    }
+
     // TODO(FFI): wire into Directory.open_output().
     fn new_output(self: &Arc<Self>, relative_path: &Path) -> io::Result<FoyerIndexOutput> {
         let path = self.path.join(relative_path);
@@ -191,9 +201,11 @@ impl FoyerIndexInput {
             .dir
             .runtime
             .block_on(self.dir.cache.get_or_fetch(&key, move || async move {
-                let (bytes_read, buf) = tokio::task::spawn_blocking(move || {
+                // TODO: improve handling for the last page. Interior pages must read a whole block,
+                // the last page must issue a whole block read but can't read everything.
+                let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
                     use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; len].into_boxed_slice();
+                    let mut buf = vec![0u8; len];
                     let bytes_read = this.file.read_at(&mut buf, offset);
                     (bytes_read, buf)
                 })
@@ -201,11 +213,10 @@ impl FoyerIndexInput {
                 .expect("blocking task panicked");
 
                 let bytes_read = bytes_read?;
-                Ok::<Box<[u8]>, io::Error>(if bytes_read == len {
-                    buf
-                } else {
-                    buf[..bytes_read].into()
-                })
+                if bytes_read != len {
+                    buf.truncate(len);
+                }
+                Ok::<_, io::Error>(buf.into_boxed_slice())
             }))
             .map_err(io::Error::other)?;
 
@@ -244,6 +255,7 @@ fn create_direct(path: &Path) -> io::Result<File> {
     }
 }
 
+// This should match Java's CRC32 class settings.
 const CRC: Crc<u32, Table<1>> = Crc::<u32, _>::new(&CRC_32_ISO_HDLC);
 
 pub struct FoyerIndexOutput {
@@ -344,7 +356,7 @@ mod ffi {
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn foyer_open_directory(
+    pub unsafe extern "C" fn foyer_directory_open(
         path: *const u8,
         path_len: u32,
         cache_bytes: u64,
@@ -358,7 +370,7 @@ mod ffi {
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn foyer_close_directory(dir: *const FoyerDirectory) {
+    pub unsafe extern "C" fn foyer_directory_close(dir: *const FoyerDirectory) {
         let dir = unsafe { Arc::from_raw(dir) };
         if Arc::strong_count(&dir) > 1 {
             eprintln!("Closing directory with open files!");
@@ -383,6 +395,98 @@ mod ffi {
         let relative_path = path_from_ptr(relative_path, len);
         dir.delete_file_id(relative_path);
         Arc::into_raw(dir);
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_directory_create_output(
+        dir: *const FoyerDirectory,
+        relative_path: *const u8,
+        path_len: u32,
+    ) -> *mut FoyerIndexOutput {
+        // NB: caller holds a reference.
+        let dir = unsafe { Arc::from_raw(dir) };
+        let relative_path = path_from_ptr(relative_path, path_len);
+        let out = dir.new_output(relative_path).unwrap();
+        Arc::into_raw(dir);
+        Box::into_raw(Box::new(out))
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_output_write_page(
+        out: *mut FoyerIndexOutput,
+        page: *const u8,
+        page_len: u32,
+    ) {
+        let out = unsafe { &mut *out };
+        let page = unsafe { std::slice::from_raw_parts(page, page_len as usize) };
+        out.write_page(page)
+            .expect("write page does not propagate errors");
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_output_checksum(
+        out: *const FoyerIndexOutput,
+        buffered: *const u8,
+        buffered_len: u32,
+    ) -> u32 {
+        let out = unsafe { &*out };
+        let buffered = unsafe { std::slice::from_raw_parts(buffered, buffered_len as usize) };
+        out.checksum(buffered)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_output_close(
+        out: *mut FoyerIndexOutput,
+        page: *const u8,
+        page_len: u32,
+        len: u32,
+    ) {
+        let out = unsafe { *Box::from_raw(out) };
+        let page = unsafe { std::slice::from_raw_parts(page, page_len as usize) };
+        out.close(page, len as usize)
+            .expect("close does not propagate errors");
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_directory_create_input(
+        dir: *const FoyerDirectory,
+        relative_path: *const u8,
+        path_len: u32,
+    ) -> *const FoyerIndexInput {
+        // NB: caller holds a reference.
+        let dir = unsafe { Arc::from_raw(dir) };
+        let relative_path = path_from_ptr(relative_path, path_len);
+        let input = dir.new_input(relative_path).unwrap();
+        Arc::into_raw(dir);
+        Arc::into_raw(input)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_input_read_page(
+        input: *const FoyerIndexInput,
+        page_id: u32,
+        out: *mut u8,
+        out_len: u32,
+    ) -> u32 {
+        // NB: caller holds a reference.
+        let input = unsafe { Arc::from_raw(input) };
+        let out = unsafe { std::slice::from_raw_parts_mut(out, out_len as usize) };
+        let bytes_read = input
+            .read_page(page_id as usize, out)
+            .expect("by policy, crash if read fails.") as u32;
+        Arc::into_raw(input);
+        bytes_read
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_input_len(input: *const FoyerIndexInput) -> u64 {
+        let input = unsafe { &*input };
+        input.len() as u64
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_input_close(input: *const FoyerIndexInput) {
+        drop(unsafe { Arc::from_raw(input) });
     }
 }
 
@@ -472,7 +576,9 @@ mod tests {
         let len = 137;
         out.close(&vec![0xBBu8; PAGE_SIZE], len).unwrap();
 
-        let file_len = std::fs::metadata(f.dir.path().join("test.bin")).unwrap().len();
+        let file_len = std::fs::metadata(f.dir.path().join("test.bin"))
+            .unwrap()
+            .len();
         assert_eq!(file_len, (PAGE_SIZE + len) as u64);
     }
 
@@ -502,7 +608,9 @@ mod tests {
         let len = 200;
         out.close(&vec![0xCCu8; PAGE_SIZE], len).unwrap();
 
-        let file_len = std::fs::metadata(f.dir.path().join("test.bin")).unwrap().len();
+        let file_len = std::fs::metadata(f.dir.path().join("test.bin"))
+            .unwrap()
+            .len();
         assert_eq!(file_len, len as u64);
     }
 
@@ -514,7 +622,9 @@ mod tests {
         out.write_page(&vec![0xAAu8; PAGE_SIZE]).unwrap();
         out.close(&vec![0xBBu8; PAGE_SIZE], 0).unwrap();
 
-        let file_len = std::fs::metadata(f.dir.path().join("test.bin")).unwrap().len();
+        let file_len = std::fs::metadata(f.dir.path().join("test.bin"))
+            .unwrap()
+            .len();
         assert_eq!(file_len, PAGE_SIZE as u64);
     }
 
