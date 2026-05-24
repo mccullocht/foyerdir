@@ -32,11 +32,6 @@ pub struct FoyerDirectory {
 impl FoyerDirectory {
     fn new(path: PathBuf, cache_size: u64, page_size: usize) -> io::Result<Self> {
         let dir_file = File::open(&path)?;
-        let cache = foyer::CacheBuilder::new(cache_size as usize)
-            .with_weighter(|_key: &CacheKey, value: &Box<[u8]>| {
-                std::mem::size_of::<CacheKey>() + value.len()
-            })
-            .build();
         let num_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
@@ -44,6 +39,13 @@ impl FoyerDirectory {
             .worker_threads(4)
             .max_blocking_threads(num_cores)
             .build()?;
+        // Build the cache inside the runtime so foyer's background tasks have a reactor.
+        let _guard = runtime.enter();
+        let cache = foyer::CacheBuilder::new(cache_size as usize)
+            .with_weighter(|_key: &CacheKey, value: &Box<[u8]>| {
+                std::mem::size_of::<CacheKey>() + value.len()
+            })
+            .build();
         Ok(Self {
             path,
             dir_file,
@@ -197,27 +199,33 @@ impl FoyerIndexInput {
         let len = out.len();
         let file = Arc::clone(&self.file);
 
+        let dir = Arc::clone(&self.dir);
         let entry = self
             .dir
             .runtime
-            .block_on(self.dir.cache.get_or_fetch(&key, move || async move {
-                // TODO: improve handling for the last page. Interior pages must read a whole block,
-                // the last page must issue a whole block read but can't read everything.
-                let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; len];
-                    let bytes_read = file.read_at(&mut buf, offset);
-                    (bytes_read, buf)
-                })
-                .await
-                .expect("blocking task panicked");
+            .block_on(async move {
+                // get_or_fetch is called inside block_on so Handle::current() is valid.
+                dir.cache
+                    .get_or_fetch(&key, move || async move {
+                        // TODO: improve handling for the last page. Interior pages must read a whole block,
+                        // the last page must issue a whole block read but can't read everything.
+                        let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
+                            use std::os::unix::fs::FileExt;
+                            let mut buf = vec![0u8; len];
+                            let bytes_read = file.read_at(&mut buf, offset);
+                            (bytes_read, buf)
+                        })
+                        .await
+                        .expect("blocking task panicked");
 
-                let bytes_read = bytes_read?;
-                if bytes_read != len {
-                    buf.truncate(len);
-                }
-                Ok::<_, io::Error>(buf.into_boxed_slice())
-            }))
+                        let bytes_read = bytes_read?;
+                        if bytes_read != len {
+                            buf.truncate(len);
+                        }
+                        Ok::<_, io::Error>(buf.into_boxed_slice())
+                    })
+                    .await
+            })
             .map_err(io::Error::other)?;
 
         let bytes: &[u8] = entry.value();
@@ -647,5 +655,166 @@ mod tests {
         let f = Fixture::new();
         let out = f.dir.new_output(Path::new("test.bin")).unwrap();
         out.close(&vec![0u8; PAGE_SIZE], PAGE_SIZE).unwrap();
+    }
+
+    struct AlignedBuf {
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+        layout: std::alloc::Layout,
+    }
+
+    impl AlignedBuf {
+        fn new(len: usize) -> Self {
+            let layout = std::alloc::Layout::from_size_align(len, 4096).unwrap();
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            let ptr = std::ptr::NonNull::new(ptr).expect("alloc failed");
+            Self { ptr, len, layout }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    impl Drop for AlignedBuf {
+        fn drop(&mut self) {
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        }
+    }
+
+    #[test]
+    fn input_len_exact_page() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+        assert_eq!(input.len(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn input_len_sub_page() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), vec![0u8; 100]).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+        assert_eq!(input.len(), 100);
+    }
+
+    #[test]
+    fn input_len_multi_page() {
+        let f = Fixture::new();
+        std::fs::write(
+            f.dir.path().join("test.bin"),
+            vec![0u8; PAGE_SIZE * 3 + 500],
+        )
+        .unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+        assert_eq!(input.len(), PAGE_SIZE * 3 + 500);
+    }
+
+    #[test]
+    fn read_page_reads_first_page() {
+        let f = Fixture::new();
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        let mut buf = AlignedBuf::new(PAGE_SIZE);
+        let n = input.read_page(0, buf.as_mut_slice()).unwrap();
+        assert_eq!(n, PAGE_SIZE);
+        assert_eq!(buf.as_slice(), data.as_slice());
+    }
+
+    #[test]
+    fn read_page_reads_second_page() {
+        let f = Fixture::new();
+        let page0 = vec![0xAAu8; PAGE_SIZE];
+        let page1 = vec![0xBBu8; PAGE_SIZE];
+        let mut data = page0.clone();
+        data.extend_from_slice(&page1);
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        let mut buf = AlignedBuf::new(PAGE_SIZE);
+        let n0 = input.read_page(0, buf.as_mut_slice()).unwrap();
+        assert_eq!(n0, PAGE_SIZE);
+        assert_eq!(buf.as_slice(), page0.as_slice());
+
+        let n1 = input.read_page(1, buf.as_mut_slice()).unwrap();
+        assert_eq!(n1, PAGE_SIZE);
+        assert_eq!(buf.as_slice(), page1.as_slice());
+    }
+
+    #[test]
+    fn read_page_last_partial_page() {
+        let f = Fixture::new();
+        let page0 = vec![0x11u8; PAGE_SIZE];
+        let tail = vec![0x22u8; 512];
+        let mut data = page0.clone();
+        data.extend_from_slice(&tail);
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        let mut page0_buf = AlignedBuf::new(PAGE_SIZE);
+        let n0 = input.read_page(0, page0_buf.as_mut_slice()).unwrap();
+        assert_eq!(n0, PAGE_SIZE);
+        assert_eq!(page0_buf.as_slice(), page0.as_slice());
+
+        let mut tail_buf = AlignedBuf::new(512);
+        let n1 = input.read_page(1, tail_buf.as_mut_slice()).unwrap();
+        assert_eq!(n1, 512);
+        assert_eq!(tail_buf.as_slice(), tail.as_slice());
+    }
+
+    #[test]
+    fn read_page_populated_by_output() {
+        let f = Fixture::new();
+        let page0: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+        let page1 = vec![0x77u8; PAGE_SIZE];
+
+        // write_page inserts pages into the cache; close with len=0 trims to 2 full pages
+        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
+        out.write_page(&page0).unwrap();
+        out.write_page(&page1).unwrap();
+        out.close(&vec![0u8; PAGE_SIZE], 0).unwrap();
+
+        // new_input reuses the same file_id, so reads hit the cache populated above
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        let mut buf = AlignedBuf::new(PAGE_SIZE);
+        let n0 = input.read_page(0, buf.as_mut_slice()).unwrap();
+        assert_eq!(n0, PAGE_SIZE);
+        assert_eq!(buf.as_slice(), page0.as_slice());
+
+        let n1 = input.read_page(1, buf.as_mut_slice()).unwrap();
+        assert_eq!(n1, PAGE_SIZE);
+        assert_eq!(buf.as_slice(), page1.as_slice());
+    }
+
+    #[test]
+    #[should_panic(expected = "page_id 1 >= pages 1")]
+    fn read_page_panics_out_of_bounds() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        let mut buf = AlignedBuf::new(PAGE_SIZE);
+        input.read_page(1, buf.as_mut_slice()).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "output buffer must be 4096-byte aligned")]
+    fn read_page_panics_misaligned_buffer() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        // Offset by 1 from a 4096-aligned base to produce a misaligned pointer
+        let mut aligned = AlignedBuf::new(PAGE_SIZE + 1);
+        let s = aligned.as_mut_slice();
+        let (_, misaligned) = s.split_at_mut(1);
+        input.read_page(0, misaligned).unwrap();
     }
 }
