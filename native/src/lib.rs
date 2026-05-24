@@ -67,7 +67,7 @@ impl FoyerDirectory {
         self.file_ids.remove(relative_path);
     }
 
-    fn new_input(self: &Arc<Self>, relative_path: &Path) -> io::Result<Arc<FoyerIndexInput>> {
+    fn new_input(self: &Arc<Self>, relative_path: &Path) -> io::Result<FoyerIndexInput> {
         let path = self.path.join(relative_path);
         FoyerIndexInput::new(
             Arc::clone(self),
@@ -120,7 +120,7 @@ impl FileIdMap {
 
 pub struct FoyerIndexInput {
     dir: Arc<FoyerDirectory>,
-    file: File,
+    file: Arc<File>,
     file_len: usize,
     file_id: usize,
     pages: usize,
@@ -158,7 +158,7 @@ impl FoyerIndexInput {
         path: &Path,
         file_id: usize,
         page_size: usize,
-    ) -> io::Result<Arc<Self>> {
+    ) -> io::Result<Self> {
         let file = open_direct(path)?;
         let file_len = file.metadata()?.len() as usize;
         let pages = file_len.div_ceil(page_size);
@@ -168,17 +168,17 @@ impl FoyerIndexInput {
             let r = file_len % page_size;
             if r == 0 { page_size } else { r }
         };
-        Ok(Arc::new(Self {
+        Ok(Self {
             dir,
-            file,
+            file: Arc::new(file),
             file_len,
             file_id,
             pages,
             last_page_size,
-        }))
+        })
     }
 
-    fn read_page(self: &Arc<Self>, page_id: usize, out: &mut [u8]) -> io::Result<usize> {
+    fn read_page(&self, page_id: usize, out: &mut [u8]) -> io::Result<usize> {
         assert!(
             page_id < self.pages,
             "page_id {page_id} >= pages {}",
@@ -195,7 +195,7 @@ impl FoyerIndexInput {
         };
         let offset = (page_id * self.dir.page_size) as u64;
         let len = out.len();
-        let this = Arc::clone(self);
+        let file = Arc::clone(&self.file);
 
         let entry = self
             .dir
@@ -206,7 +206,7 @@ impl FoyerIndexInput {
                 let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
                     use std::os::unix::fs::FileExt;
                     let mut buf = vec![0u8; len];
-                    let bytes_read = this.file.read_at(&mut buf, offset);
+                    let bytes_read = file.read_at(&mut buf, offset);
                     (bytes_read, buf)
                 })
                 .await
@@ -420,7 +420,7 @@ mod ffi {
         let out = unsafe { &mut *out };
         let page = unsafe { std::slice::from_raw_parts(page, page_len as usize) };
         out.write_page(page)
-            .expect("write page does not propagate errors");
+            .expect("output write page does not propagate errors");
     }
 
     #[unsafe(no_mangle)]
@@ -444,7 +444,7 @@ mod ffi {
         let out = unsafe { *Box::from_raw(out) };
         let page = unsafe { std::slice::from_raw_parts(page, page_len as usize) };
         out.close(page, len as usize)
-            .expect("close does not propagate errors");
+            .expect("output close does not propagate errors");
     }
 
     #[unsafe(no_mangle)]
@@ -452,41 +452,38 @@ mod ffi {
         dir: *const FoyerDirectory,
         relative_path: *const u8,
         path_len: u32,
-    ) -> *const FoyerIndexInput {
+    ) -> *mut FoyerIndexInput {
         // NB: caller holds a reference.
         let dir = unsafe { Arc::from_raw(dir) };
         let relative_path = path_from_ptr(relative_path, path_len);
         let input = dir.new_input(relative_path).unwrap();
         Arc::into_raw(dir);
-        Arc::into_raw(input)
+        Box::into_raw(Box::new(input))
     }
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn foyer_index_input_read_page(
-        input: *const FoyerIndexInput,
+        input: *mut FoyerIndexInput,
         page_id: u32,
         out: *mut u8,
         out_len: u32,
     ) -> u32 {
-        // NB: caller holds a reference.
-        let input = unsafe { Arc::from_raw(input) };
+        let input = unsafe { &*input };
         let out = unsafe { std::slice::from_raw_parts_mut(out, out_len as usize) };
-        let bytes_read = input
+        input
             .read_page(page_id as usize, out)
-            .expect("by policy, crash if read fails.") as u32;
-        Arc::into_raw(input);
-        bytes_read
+            .expect("input read page does not propagate errors") as u32
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn foyer_index_input_len(input: *const FoyerIndexInput) -> u64 {
+    pub unsafe extern "C" fn foyer_index_input_len(input: *mut FoyerIndexInput) -> u64 {
         let input = unsafe { &*input };
         input.len() as u64
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn foyer_index_input_close(input: *const FoyerIndexInput) {
-        drop(unsafe { Arc::from_raw(input) });
+    pub unsafe extern "C" fn foyer_index_input_close(input: *mut FoyerIndexInput) {
+        drop(unsafe { Box::from_raw(input) });
     }
 }
 
