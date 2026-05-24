@@ -55,12 +55,16 @@ public final class FoyerDirectory extends BaseDirectory {
             MemorySegment pathSeg = tmp.allocateFrom(ValueLayout.JAVA_BYTE, pathBytes);
             this.nativeHandle = ((MemorySegment) FoyerDirectoryBindings.DIRECTORY_OPEN.invokeExact(
                     pathSeg, pathBytes.length, cacheBytes, logPageSize))
-                    .reinterpret(0, this.arena, null);
+                    .reinterpret(0, this.arena, ptr -> {
+                        try {
+                            FoyerDirectoryBindings.DIRECTORY_CLOSE.invokeExact(ptr);
+                        } catch (Throwable t) {
+                            throw new RuntimeException(t);
+                        }
+                    });
         } catch (Throwable t) {
             this.arena.close();
-            if (t instanceof IOException ioe)
-                throw ioe;
-            throw new IOException(t);
+            throw new RuntimeException(t);
 
         }
     }
@@ -168,18 +172,11 @@ public final class FoyerDirectory extends BaseDirectory {
     }
 
     @Override
+
     public void close() throws IOException {
         // NB: this "closes" the directory on the native side. This should not cause crashes as the
         // native directory is refcounted by all inputs/outputs.
         this.isOpen = false;
-        try {
-            FoyerDirectoryBindings.DIRECTORY_CLOSE.invokeExact(nativeHandle);
-        } catch (Throwable t) {
-            if (t instanceof IOException ioe) throw ioe;
-            throw new IOException(t);
-
-        } finally {
-            arena.close();
-        }
+        this.arena.close();
     }
 }

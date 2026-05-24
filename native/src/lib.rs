@@ -472,7 +472,7 @@ mod ffi {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn foyer_index_input_read_page(
         input: *mut FoyerIndexInput,
-        page_id: u32,
+        page_id: u64,
         out: *mut u8,
         out_len: u32,
     ) -> u32 {

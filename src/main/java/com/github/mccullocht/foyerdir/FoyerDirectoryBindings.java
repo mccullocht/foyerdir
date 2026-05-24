@@ -104,7 +104,7 @@ final class FoyerDirectoryBindings {
                     FunctionDescriptor.of(
                             ValueLayout.JAVA_INT,
                             ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG,
                             ValueLayout.ADDRESS,
                             ValueLayout.JAVA_INT));
             INDEX_INPUT_LEN = linker.downcallHandle(
@@ -120,7 +120,8 @@ final class FoyerDirectoryBindings {
         }
     }
 
-    private FoyerDirectoryBindings() {}
+    private FoyerDirectoryBindings() {
+    }
 
     private static SymbolLookup loadNativeLibrary() throws Exception {
         String os = System.getProperty("os.name").toLowerCase();
