@@ -28,6 +28,7 @@ public final class FoyerDirectory extends BaseDirectory {
     private static final int CHUNK_SIZE = 8192;
 
     private final Path path;
+    private final int pageSize;
     private final AtomicLong nextTempFileCounter = new AtomicLong();
 
     private final Arena arena;
@@ -45,6 +46,7 @@ public final class FoyerDirectory extends BaseDirectory {
     public FoyerDirectory(Path path, long cacheBytes, int logPageSize) throws IOException {
         super(NativeFSLockFactory.INSTANCE);
         this.path = path;
+        this.pageSize = 1 << logPageSize;
         if (logPageSize < 12) {
             throw new IllegalArgumentException("logPageSize must be at least 12");
         }
@@ -162,7 +164,25 @@ public final class FoyerDirectory extends BaseDirectory {
 
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
-        throw new UnsupportedOperationException("unimplemented");
+        ensureOpen();
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        Arena inputArena = Arena.ofAuto();
+        MemorySegment ptr;
+        try (var tmp = Arena.ofConfined()) {
+            MemorySegment nameSeg = tmp.allocateFrom(ValueLayout.JAVA_BYTE, nameBytes);
+            ptr = ((MemorySegment) FoyerDirectoryBindings.DIRECTORY_CREATE_INPUT.invokeExact(
+                    nativeHandle, nameSeg, nameBytes.length))
+                    .reinterpret(0, inputArena, p -> {
+                        try {
+                            FoyerDirectoryBindings.INDEX_INPUT_CLOSE.invokeExact(p);
+                        } catch (Throwable t) {
+                            throw new RuntimeException(t);
+                        }
+                    });
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+        return new FoyerIndexInput("FoyerIndexInput(path=\"" + path.resolve(name) + "\")", inputArena, ptr, pageSize);
     }
 
     @Override
