@@ -64,7 +64,6 @@ impl FoyerDirectory {
         self.dir_file.sync_all()
     }
 
-    // TODO(FFI): wire into Directory.delete().
     fn delete_file_id(&self, relative_path: &Path) {
         self.file_ids.remove(relative_path);
     }
@@ -79,7 +78,6 @@ impl FoyerDirectory {
         )
     }
 
-    // TODO(FFI): wire into Directory.open_output().
     fn new_output(self: &Arc<Self>, relative_path: &Path) -> io::Result<FoyerIndexOutput> {
         let path = self.path.join(relative_path);
         FoyerIndexOutput::new(
@@ -380,9 +378,6 @@ mod ffi {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn foyer_directory_close(dir: *const FoyerDirectory) {
         let dir = unsafe { Arc::from_raw(dir) };
-        if Arc::strong_count(&dir) > 1 {
-            eprintln!("Closing directory with open files!");
-        }
     }
 
     #[unsafe(no_mangle)]

@@ -91,6 +91,13 @@ public final class FoyerDirectory extends BaseDirectory {
     public void deleteFile(String name) throws IOException {
         ensureOpen();
         Files.delete(path.resolve(name));
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        try (var tmp = Arena.ofConfined()) {
+            MemorySegment nameSeg = tmp.allocateFrom(ValueLayout.JAVA_BYTE, nameBytes);
+            FoyerDirectoryBindings.DIRECTORY_DELETE_FILE_ID.invokeExact(nativeHandle, nameSeg, nameBytes.length);
+        } catch (Throwable t) {
+            throw new IOException(t);
+        }
     }
 
     @Override
