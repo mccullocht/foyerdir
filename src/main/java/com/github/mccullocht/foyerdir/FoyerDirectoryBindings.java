@@ -35,6 +35,8 @@ final class FoyerDirectoryBindings {
     static final MethodHandle INDEX_INPUT_READ_PAGE;
     // foyer_index_input_len(input) -> u64
     static final MethodHandle INDEX_INPUT_LEN;
+    // foyer_index_input_prefetch(input, offset, length)
+    static final MethodHandle INDEX_INPUT_PREFETCH;
     // foyer_index_input_close(input)
     static final MethodHandle INDEX_INPUT_CLOSE;
 
@@ -112,6 +114,12 @@ final class FoyerDirectoryBindings {
                     FunctionDescriptor.of(
                             ValueLayout.JAVA_LONG,
                             ValueLayout.ADDRESS));
+            INDEX_INPUT_PREFETCH = linker.downcallHandle(
+                    symbols.findOrThrow("foyer_index_input_prefetch"),
+                    FunctionDescriptor.ofVoid(
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
             INDEX_INPUT_CLOSE = linker.downcallHandle(
                     symbols.findOrThrow("foyer_index_input_close"),
                     FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));

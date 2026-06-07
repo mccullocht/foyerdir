@@ -234,6 +234,45 @@ impl FoyerIndexInput {
     fn len(&self) -> usize {
         self.file_len
     }
+
+    fn prefetch(&self, offset: u64, length: u64) {
+        if self.pages == 0 || length == 0 {
+            return;
+        }
+        let page_size = self.dir.page_size;
+        let first_page = offset as usize / page_size;
+        let last_byte = offset.saturating_add(length).saturating_sub(1);
+        let last_page = (last_byte as usize / page_size).min(self.pages - 1);
+        for page_id in first_page..=last_page {
+            let key = CacheKey { file: self.file_id, page: page_id };
+            if self.dir.cache.get(&key).is_some() {
+                continue;
+            }
+            let dir = Arc::clone(&self.dir);
+            let file = Arc::clone(&self.file);
+            let page_offset = (page_id * page_size) as u64;
+            self.dir.runtime.spawn(async move {
+                // get_or_fetch is called inside spawn so Handle::current() is valid.
+                let _ = dir.cache
+                    .get_or_fetch(&key, move || async move {
+                        let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
+                            use std::os::unix::fs::FileExt;
+                            let mut buf = vec![0u8; page_size];
+                            let bytes_read = file.read_at(&mut buf, page_offset);
+                            (bytes_read, buf)
+                        })
+                        .await
+                        .expect("blocking task panicked");
+                        let bytes_read = bytes_read?;
+                        if bytes_read != page_size {
+                            buf.truncate(page_size);
+                        }
+                        Ok::<_, io::Error>(buf.into_boxed_slice())
+                    })
+                    .await;
+            });
+        }
+    }
 }
 
 /// Creates a write-only file, bypassing the kernel buffer cache.
@@ -482,6 +521,16 @@ mod ffi {
     pub unsafe extern "C" fn foyer_index_input_len(input: *mut FoyerIndexInput) -> u64 {
         let input = unsafe { &*input };
         input.len() as u64
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_input_prefetch(
+        input: *const FoyerIndexInput,
+        offset: u64,
+        length: u64,
+    ) {
+        let input = unsafe { &*input };
+        input.prefetch(offset, length);
     }
 
     #[unsafe(no_mangle)]
