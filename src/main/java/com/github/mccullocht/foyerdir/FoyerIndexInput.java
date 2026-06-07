@@ -1,5 +1,6 @@
 package com.github.mccullocht.foyerdir;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -82,7 +83,7 @@ final class FoyerIndexInput extends IndexInput {
     @Override
     public byte readByte() throws IOException {
         if (filePointer >= sliceLength) {
-            throw new IOException("read past end of slice");
+            throw new EOFException("read past end of slice");
         }
         long absPos = sliceOffset + filePointer;
         if (buf == null || absPos < bufPageStart || absPos >= bufPageStart + buf.limit()) {
@@ -95,7 +96,7 @@ final class FoyerIndexInput extends IndexInput {
     @Override
     public void readBytes(byte[] b, int offset, int length) throws IOException {
         if (filePointer + length > sliceLength) {
-            throw new IOException("read past end of slice");
+            throw new EOFException("read past end of slice");
         }
         while (length > 0) {
             long absPos = sliceOffset + filePointer;
@@ -118,8 +119,11 @@ final class FoyerIndexInput extends IndexInput {
 
     @Override
     public void seek(long pos) throws IOException {
-        if (pos < 0 || pos > sliceLength) {
-            throw new IllegalArgumentException("seek out of range: " + pos);
+        if (pos < 0) {
+            throw new IllegalArgumentException("seek position must be >= 0: " + pos);
+        }
+        if (pos > sliceLength) {
+            throw new EOFException("seek past EOF: " + pos + " > " + sliceLength);
         }
         filePointer = pos;
     }
@@ -138,7 +142,7 @@ final class FoyerIndexInput extends IndexInput {
 
     @Override
     public IndexInput slice(String sliceDescription, long offset, long length) throws IOException {
-        if (offset < 0 || length < 0 || offset + length > sliceLength) {
+        if (offset < 0 || length < 0 || offset > sliceLength || length > sliceLength - offset) {
             throw new IllegalArgumentException(
                     "invalid slice: offset=" + offset + " length=" + length + " of " + sliceLength);
         }

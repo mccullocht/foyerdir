@@ -15,6 +15,7 @@ repositories {
 
 dependencies {
     implementation("org.apache.lucene:lucene-core:10.4.0")
+    testImplementation("org.apache.lucene:lucene-test-framework:10.4.0")
 }
 
 rustCdylib {
