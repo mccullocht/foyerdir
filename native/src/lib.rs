@@ -1,14 +1,27 @@
-// XXX remove.
 #![allow(unused)]
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
+use aligned_vec::{ABox, AVec, ConstAlign};
 use crc::{CRC_32_ISO_HDLC, Crc, Digest, Table};
+use foyer::{CacheEntry, GetOrFetch};
+use futures::future::join_all;
+
+const PAGE_ALIGNMENT: usize = 4096;
+type PageVec = AVec<u8, ConstAlign<PAGE_ALIGNMENT>>;
+type PageBox = ABox<[u8], ConstAlign<PAGE_ALIGNMENT>>;
+
+fn alloc_page(len: usize) -> PageVec {
+    let mut v = PageVec::with_capacity(4096, len.next_multiple_of(4096));
+    v.resize(len.next_multiple_of(4096), 0u8);
+    v
+}
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
@@ -23,7 +36,7 @@ struct CacheKey {
 pub struct FoyerDirectory {
     path: PathBuf,
     dir_file: File,
-    cache: foyer::Cache<CacheKey, Box<[u8]>>,
+    cache: foyer::Cache<CacheKey, PageBox>,
     page_size: usize,
     runtime: tokio::runtime::Runtime,
     file_ids: FileIdMap,
@@ -42,8 +55,8 @@ impl FoyerDirectory {
         // Build the cache inside the runtime so foyer's background tasks have a reactor.
         let _guard = runtime.enter();
         let cache = foyer::CacheBuilder::new(cache_size as usize)
-            .with_weighter(|_key: &CacheKey, value: &Box<[u8]>| {
-                std::mem::size_of::<CacheKey>() + value.len()
+            .with_weighter(|_key: &CacheKey, value: &PageBox| {
+                std::mem::size_of::<CacheKey>() + value.len().next_multiple_of(PAGE_ALIGNMENT)
             })
             .build();
         Ok(Self {
@@ -184,10 +197,6 @@ impl FoyerIndexInput {
             "page_id {page_id} >= pages {}",
             self.pages
         );
-        assert!(
-            out.as_ptr() as usize % 4096 == 0,
-            "output buffer must be 4096-byte aligned"
-        );
 
         let key = CacheKey {
             file: self.file_id,
@@ -209,7 +218,7 @@ impl FoyerIndexInput {
                         // the last page must issue a whole block read but can't read everything.
                         let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
                             use std::os::unix::fs::FileExt;
-                            let mut buf = vec![0u8; len];
+                            let mut buf = alloc_page(len);
                             let bytes_read = file.read_at(&mut buf, offset);
                             (bytes_read, buf)
                         })
@@ -218,7 +227,7 @@ impl FoyerIndexInput {
 
                         let bytes_read = bytes_read?;
                         if bytes_read != len {
-                            buf.truncate(len);
+                            buf.truncate(bytes_read);
                         }
                         Ok::<_, io::Error>(buf.into_boxed_slice())
                     })
@@ -231,33 +240,104 @@ impl FoyerIndexInput {
         Ok(bytes.len())
     }
 
+    /// pread starting at `off` into `out`, writing up to `out.len()` bytes.
+    ///
+    /// Returns the number of bytes actually read into the buffer.
+    ///
+    /// This method is intended to handle small buffered reads for IndexInput API calls that
+    /// read very small amounts of data (a byte to a few KB).
+    /// requesting a few KB of data or less.
+    fn read_at(&self, off: u64, out: &mut [u8]) -> foyer::Result<u64> {
+        let pinned_read = self.read_chunked(off, off + out.len() as u64)?;
+        let mut out_next = 0usize;
+        for s in pinned_read.page_iter() {
+            let out_end = out_next + s.len();
+            out[out_next..out_end].copy_from_slice(s);
+            out_next = out_end;
+        }
+        Ok(out_next as u64)
+    }
+
+    /// pread starting at `off` and up to `len` bytes.
+    ///
+    /// Returns a struct containing references to page cache entries and an iterator that can be
+    /// used to access all of the bytes in the range.
+    ///
+    /// This method is intended for large reads where it would be impractical to allocate a direct
+    /// ByteBuffer to pass down to the native layer. This method returns a handle that _pins entries
+    /// in the cache_ which prevents those entries from being freed. Callers are encouraged to
+    /// free the handle quickly to avoid locking up cache space.
+    fn read_chunked(&self, off: u64, len: u64) -> foyer::Result<ReadChunks> {
+        let pages = if let Some(pages) = self.page_range(off, len) {
+            let page_reads = self.read_pages(pages);
+            if page_reads.iter().any(GetOrFetch::need_await) {
+                let read = self
+                    .dir
+                    .runtime
+                    .block_on(async move { join_all(page_reads).await });
+                read.into_iter().collect::<foyer::Result<Vec<_>>>()
+            } else {
+                Ok(page_reads
+                    .into_iter()
+                    .map(|p| p.try_unwrap().expect("in cache"))
+                    .collect())
+            }
+        } else {
+            Ok(vec![])
+        }?;
+        Ok(ReadChunks::new(pages, self.dir.page_size, off, len))
+    }
+
+    /// Fetch the pages necessary to read `off..(off + len)` into the cache.
+    /// This method issues any necessary reads asynchronously without blocking so the pages are not
+    /// guaranteed to exist when this call returns.
+    fn prefetch(&self, off: u64, len: u64) {
+        if let Some(pages) = self.page_range(off, len) {
+            let page_reads = self.read_pages(pages);
+            if page_reads.iter().any(GetOrFetch::need_await) {
+                self.dir.runtime.spawn(async move { join_all(page_reads) });
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.file_len
     }
 
-    fn prefetch(&self, offset: u64, length: u64) {
-        if self.pages == 0 || length == 0 {
-            return;
+    /// Computes a range of pages to read to get all of the bytes in `off..(off + len)`.
+    /// Returns `None` if this range would not produce any pages.
+    fn page_range(&self, off: u64, len: u64) -> Option<RangeInclusive<usize>> {
+        if self.pages > 0 && len > 0 && off < self.file_len as u64 {
+            let page_size = self.dir.page_size;
+            let first_page = off as usize / page_size;
+            let last_byte = off + len - 1;
+            let last_page = last_byte as usize / page_size;
+            Some(first_page..=last_page)
+        } else {
+            None
         }
-        let page_size = self.dir.page_size;
-        let first_page = offset as usize / page_size;
-        let last_byte = offset.saturating_add(length).saturating_sub(1);
-        let last_page = (last_byte as usize / page_size).min(self.pages - 1);
-        for page_id in first_page..=last_page {
-            let key = CacheKey { file: self.file_id, page: page_id };
-            if self.dir.cache.get(&key).is_some() {
-                continue;
-            }
-            let dir = Arc::clone(&self.dir);
-            let file = Arc::clone(&self.file);
-            let page_offset = (page_id * page_size) as u64;
-            self.dir.runtime.spawn(async move {
-                // get_or_fetch is called inside spawn so Handle::current() is valid.
-                let _ = dir.cache
-                    .get_or_fetch(&key, move || async move {
+    }
+
+    fn read_pages(
+        &self,
+        pages: impl IntoIterator<Item = usize>,
+    ) -> Vec<GetOrFetch<CacheKey, PageBox>> {
+        pages
+            .into_iter()
+            .map(|p| {
+                let dir = Arc::clone(&self.dir);
+                let file = Arc::clone(&self.file);
+                let page_size = dir.page_size;
+                let page_offset = dir.page_size as u64 * p as u64;
+                dir.cache.get_or_fetch(
+                    &CacheKey {
+                        file: self.file_id,
+                        page: p as usize,
+                    },
+                    move || async move {
                         let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
                             use std::os::unix::fs::FileExt;
-                            let mut buf = vec![0u8; page_size];
+                            let mut buf = alloc_page(page_size);
                             let bytes_read = file.read_at(&mut buf, page_offset);
                             (bytes_read, buf)
                         })
@@ -268,10 +348,54 @@ impl FoyerIndexInput {
                             buf.truncate(page_size);
                         }
                         Ok::<_, io::Error>(buf.into_boxed_slice())
-                    })
-                    .await;
-            });
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Results of a read spanning some file range structured as a series of cached pages.
+///
+/// This holds pins on relevant cache entries and provides methods to examine the read bytes as
+/// a series of byte slices that can be read in place or copied out e.g. to JVM heap buffers.
+pub struct ReadChunks {
+    pages: Vec<CacheEntry<CacheKey, PageBox>>,
+    first_page_off: usize,
+    last_page_len: usize,
+}
+
+impl ReadChunks {
+    fn new(
+        pages: Vec<CacheEntry<CacheKey, PageBox>>,
+        page_size: usize,
+        off: u64,
+        len: u64,
+    ) -> Self {
+        let first_page_off = (off % page_size as u64) as usize;
+        let last_page_idx = ((off + len) % page_size as u64) as usize;
+        let last_page_len = if last_page_idx == 0 {
+            page_size
+        } else {
+            last_page_idx
+        };
+        Self {
+            pages,
+            first_page_off,
+            last_page_len,
         }
+    }
+
+    fn page_iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.pages.iter().enumerate().map(|(i, p)| {
+            let start = if i == 0 { self.first_page_off } else { 0 };
+            let end = if i == self.pages.len() - 1 {
+                self.last_page_len
+            } else {
+                p.len()
+            };
+            &p[start..end]
+        })
     }
 }
 
@@ -335,8 +459,9 @@ impl FoyerIndexOutput {
     /// *Panics* if page.len() does not match page size.
     fn write_page(&mut self, page: &[u8]) -> io::Result<()> {
         assert_eq!(page.len(), self.page_size);
-        self.file.write_all(page)?;
-        self.checksum.update(page);
+        let page = PageVec::from_slice(PAGE_ALIGNMENT, page);
+        self.file.write_all(&page)?;
+        self.checksum.update(&page);
         let key = CacheKey {
             file: self.file_id,
             page: self.page,
@@ -346,7 +471,7 @@ impl FoyerIndexOutput {
                 file: self.file_id,
                 page: self.page,
             },
-            Box::from(page),
+            page.into_boxed_slice(),
         );
         self.page += 1;
         Ok(())
@@ -366,10 +491,12 @@ impl FoyerIndexOutput {
     /// *Panics* if bytes.len() does not match page size.
     fn close(mut self, page: &[u8], len: usize) -> io::Result<()> {
         assert_eq!(page.len(), self.page_size);
-        assert!(len < self.page_size, "{len} {}", self.page_size);
-        self.file.write_all(page)?;
+        assert!(len <= self.page_size, "{len} {}", self.page_size);
+        let mut page = PageVec::from_slice(PAGE_ALIGNMENT, page);
+        self.file.write_all(&page)?;
         self.file
             .set_len((self.page * self.page_size + len) as u64)?;
+        page.truncate(len);
         if let Err(e) = self.file.sync_all() {
             panic!("Failed to flush file: {e}");
         }
@@ -378,7 +505,10 @@ impl FoyerIndexOutput {
                 file: self.file_id,
                 page: self.page,
             },
-            Box::from(&page[..len]),
+            {
+                page.truncate(len);
+                page.into_boxed_slice()
+            },
         );
         Ok(())
     }
@@ -518,9 +648,72 @@ mod ffi {
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn foyer_index_input_len(input: *mut FoyerIndexInput) -> u64 {
+    pub unsafe extern "C" fn foyer_index_input_read_at(
+        input: *mut FoyerIndexInput,
+        offset: u64,
+        length: u64,
+        out: *mut u8,
+        out_len: u32,
+    ) -> u32 {
         let input = unsafe { &*input };
-        input.len() as u64
+        let out = unsafe { std::slice::from_raw_parts_mut(out, out_len as usize) };
+        input
+            .read_at(offset, out)
+            .expect("input read_at does not propagate errors") as u32
+    }
+
+    /// Pointer address + length pair for byte arrays.
+    #[repr(C)]
+    pub struct ByteSliceAddr {
+        pub addr: u64,
+        pub len: u64,
+    }
+
+    impl From<&[u8]> for ByteSliceAddr {
+        fn from(value: &[u8]) -> Self {
+            Self {
+                addr: value.as_ptr().addr() as u64,
+                len: value.len() as u64,
+            }
+        }
+    }
+
+    /// Holds an FFI friendly representation of a series of pages and extents within each page that
+    /// are used to serve a read request. This struct keeps referenced data alive until dropped.
+    #[repr(C)]
+    pub struct FoyerReadChunks {
+        pub page_len: u64,
+        pub page_extents: *const ByteSliceAddr,
+        // The following fields are not visible to FFI callers.
+        pages: ReadChunks,
+        page_extents_vec: Vec<ByteSliceAddr>, // aliased by slices.
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_input_read_chunks(
+        input: *mut FoyerIndexInput,
+        offset: u64,
+        length: u64,
+    ) -> *const FoyerReadChunks {
+        let input = unsafe { &*input };
+        let pages = input
+            .read_chunked(offset, length)
+            .expect("input read_at does not propagate errors");
+        let page_extents_vec = pages
+            .page_iter()
+            .map(ByteSliceAddr::from)
+            .collect::<Vec<_>>();
+        Box::into_raw(Box::new(FoyerReadChunks {
+            page_len: page_extents_vec.len() as u64,
+            page_extents: page_extents_vec.as_ptr(),
+            pages,
+            page_extents_vec,
+        }))
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_read_chunks_drop(read_chunks: *mut FoyerReadChunks) {
+        drop(unsafe { Box::from_raw(read_chunks) });
     }
 
     #[unsafe(no_mangle)]
@@ -531,6 +724,12 @@ mod ffi {
     ) {
         let input = unsafe { &*input };
         input.prefetch(offset, length);
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn foyer_index_input_len(input: *mut FoyerIndexInput) -> u64 {
+        let input = unsafe { &*input };
+        input.len() as u64
     }
 
     #[unsafe(no_mangle)]
@@ -694,43 +893,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn close_panics_when_len_equals_page_size() {
-        let f = Fixture::new();
-        let out = f.dir.new_output(Path::new("test.bin")).unwrap();
-        out.close(&vec![0u8; PAGE_SIZE], PAGE_SIZE).unwrap();
-    }
-
-    struct AlignedBuf {
-        ptr: std::ptr::NonNull<u8>,
-        len: usize,
-        layout: std::alloc::Layout,
-    }
-
-    impl AlignedBuf {
-        fn new(len: usize) -> Self {
-            let layout = std::alloc::Layout::from_size_align(len, 4096).unwrap();
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-            let ptr = std::ptr::NonNull::new(ptr).expect("alloc failed");
-            Self { ptr, len, layout }
-        }
-
-        fn as_mut_slice(&mut self) -> &mut [u8] {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-        }
-
-        fn as_slice(&self) -> &[u8] {
-            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-        }
-    }
-
-    impl Drop for AlignedBuf {
-        fn drop(&mut self) {
-            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
-        }
-    }
-
-    #[test]
     fn input_len_exact_page() {
         let f = Fixture::new();
         std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
@@ -765,10 +927,10 @@ mod tests {
         std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
         let input = f.dir.new_input(Path::new("test.bin")).unwrap();
 
-        let mut buf = AlignedBuf::new(PAGE_SIZE);
-        let n = input.read_page(0, buf.as_mut_slice()).unwrap();
+        let mut buf = alloc_page(PAGE_SIZE);
+        let n = input.read_page(0, &mut buf).unwrap();
         assert_eq!(n, PAGE_SIZE);
-        assert_eq!(buf.as_slice(), data.as_slice());
+        assert_eq!(&buf[..], data.as_slice());
     }
 
     #[test]
@@ -781,14 +943,14 @@ mod tests {
         std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
         let input = f.dir.new_input(Path::new("test.bin")).unwrap();
 
-        let mut buf = AlignedBuf::new(PAGE_SIZE);
-        let n0 = input.read_page(0, buf.as_mut_slice()).unwrap();
+        let mut buf = alloc_page(PAGE_SIZE);
+        let n0 = input.read_page(0, &mut buf).unwrap();
         assert_eq!(n0, PAGE_SIZE);
-        assert_eq!(buf.as_slice(), page0.as_slice());
+        assert_eq!(&buf[..], page0.as_slice());
 
-        let n1 = input.read_page(1, buf.as_mut_slice()).unwrap();
+        let n1 = input.read_page(1, &mut buf).unwrap();
         assert_eq!(n1, PAGE_SIZE);
-        assert_eq!(buf.as_slice(), page1.as_slice());
+        assert_eq!(&buf[..], page1.as_slice());
     }
 
     #[test]
@@ -801,15 +963,15 @@ mod tests {
         std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
         let input = f.dir.new_input(Path::new("test.bin")).unwrap();
 
-        let mut page0_buf = AlignedBuf::new(PAGE_SIZE);
-        let n0 = input.read_page(0, page0_buf.as_mut_slice()).unwrap();
+        let mut page0_buf = alloc_page(PAGE_SIZE);
+        let n0 = input.read_page(0, &mut page0_buf).unwrap();
         assert_eq!(n0, PAGE_SIZE);
-        assert_eq!(page0_buf.as_slice(), page0.as_slice());
+        assert_eq!(&page0_buf[..], page0.as_slice());
 
-        let mut tail_buf = AlignedBuf::new(512);
-        let n1 = input.read_page(1, tail_buf.as_mut_slice()).unwrap();
+        let mut tail_buf = alloc_page(512);
+        let n1 = input.read_page(1, &mut tail_buf).unwrap();
         assert_eq!(n1, 512);
-        assert_eq!(tail_buf.as_slice(), tail.as_slice());
+        assert_eq!(&tail_buf[..n1], tail.as_slice());
     }
 
     #[test]
@@ -827,14 +989,14 @@ mod tests {
         // new_input reuses the same file_id, so reads hit the cache populated above
         let input = f.dir.new_input(Path::new("test.bin")).unwrap();
 
-        let mut buf = AlignedBuf::new(PAGE_SIZE);
-        let n0 = input.read_page(0, buf.as_mut_slice()).unwrap();
+        let mut buf = alloc_page(PAGE_SIZE);
+        let n0 = input.read_page(0, &mut buf).unwrap();
         assert_eq!(n0, PAGE_SIZE);
-        assert_eq!(buf.as_slice(), page0.as_slice());
+        assert_eq!(&buf[..], page0.as_slice());
 
-        let n1 = input.read_page(1, buf.as_mut_slice()).unwrap();
+        let n1 = input.read_page(1, &mut buf).unwrap();
         assert_eq!(n1, PAGE_SIZE);
-        assert_eq!(buf.as_slice(), page1.as_slice());
+        assert_eq!(&buf[..], page1.as_slice());
     }
 
     #[test]
@@ -844,21 +1006,7 @@ mod tests {
         std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
         let input = f.dir.new_input(Path::new("test.bin")).unwrap();
 
-        let mut buf = AlignedBuf::new(PAGE_SIZE);
-        input.read_page(1, buf.as_mut_slice()).unwrap();
-    }
-
-    #[test]
-    #[should_panic(expected = "output buffer must be 4096-byte aligned")]
-    fn read_page_panics_misaligned_buffer() {
-        let f = Fixture::new();
-        std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
-        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
-
-        // Offset by 1 from a 4096-aligned base to produce a misaligned pointer
-        let mut aligned = AlignedBuf::new(PAGE_SIZE + 1);
-        let s = aligned.as_mut_slice();
-        let (_, misaligned) = s.split_at_mut(1);
-        input.read_page(0, misaligned).unwrap();
+        let mut buf = alloc_page(PAGE_SIZE);
+        input.read_page(1, &mut buf).unwrap();
     }
 }
