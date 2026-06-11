@@ -268,6 +268,7 @@ impl FoyerIndexInput {
     /// in the cache_ which prevents those entries from being freed. Callers are encouraged to
     /// free the handle quickly to avoid locking up cache space.
     fn read_chunked(&self, off: u64, len: u64) -> foyer::Result<ReadChunks> {
+        let _guard = self.dir.runtime.enter();
         let pages = if let Some(pages) = self.page_range(off, len) {
             let page_reads = self.read_pages(pages);
             if page_reads.iter().any(GetOrFetch::need_await) {
@@ -293,9 +294,12 @@ impl FoyerIndexInput {
     /// guaranteed to exist when this call returns.
     fn prefetch(&self, off: u64, len: u64) {
         if let Some(pages) = self.page_range(off, len) {
+            let _guard = self.dir.runtime.enter();
             let page_reads = self.read_pages(pages);
             if page_reads.iter().any(GetOrFetch::need_await) {
-                self.dir.runtime.spawn(async move { join_all(page_reads) });
+                self.dir
+                    .runtime
+                    .spawn(async move { join_all(page_reads).await });
             }
         }
     }
@@ -1008,5 +1012,136 @@ mod tests {
 
         let mut buf = alloc_page(PAGE_SIZE);
         input.read_page(1, &mut buf).unwrap();
+    }
+
+    #[test]
+    fn prefetch_zero_len_is_noop() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), vec![0x42u8; PAGE_SIZE]).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+        input.prefetch(0, 0); // page_range returns None, nothing should happen
+    }
+
+    #[test]
+    fn prefetch_offset_past_eof_is_noop() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), vec![0x42u8; PAGE_SIZE]).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+        input.prefetch(PAGE_SIZE as u64 + 1, 100); // past EOF, page_range returns None
+    }
+
+    #[test]
+    fn prefetch_empty_file_is_noop() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.path().join("test.bin"), b"").unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+        input.prefetch(0, 100); // pages == 0, page_range returns None
+    }
+
+    #[test]
+    fn prefetch_single_page_cold_data_remains_readable() {
+        let f = Fixture::new();
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        input.prefetch(0, PAGE_SIZE as u64);
+
+        let mut buf = alloc_page(PAGE_SIZE);
+        let n = input.read_page(0, &mut buf).unwrap();
+        assert_eq!(n, PAGE_SIZE);
+        assert_eq!(&buf[..], data.as_slice());
+    }
+
+    #[test]
+    fn prefetch_multi_page_cold_data_remains_readable() {
+        let f = Fixture::new();
+        let data: Vec<u8> = (0..PAGE_SIZE * 3).map(|i| (i % 251) as u8).collect();
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        input.prefetch(0, (PAGE_SIZE * 3) as u64);
+
+        let mut buf = alloc_page(PAGE_SIZE);
+        for page_id in 0..3 {
+            let n = input.read_page(page_id, &mut buf).unwrap();
+            assert_eq!(n, PAGE_SIZE);
+            assert_eq!(
+                &buf[..],
+                &data[page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE]
+            );
+        }
+    }
+
+    #[test]
+    fn prefetch_warm_pages_data_still_readable() {
+        // Read a page into cache first, then prefetch the same range.
+        // The need_await == false path should be exercised and reads must still return correct data.
+        let f = Fixture::new();
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        let mut buf = alloc_page(PAGE_SIZE);
+        input.read_page(0, &mut buf).unwrap();
+
+        // Page is now in cache; prefetch should skip the spawn and be a no-op.
+        input.prefetch(0, PAGE_SIZE as u64);
+
+        let n = input.read_page(0, &mut buf).unwrap();
+        assert_eq!(n, PAGE_SIZE);
+        assert_eq!(&buf[..], data.as_slice());
+    }
+
+    #[test]
+    fn prefetch_partial_range_within_single_page() {
+        // A small window inside page 0 should only touch that one page.
+        let f = Fixture::new();
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        input.prefetch(128, 512);
+
+        let mut buf = alloc_page(PAGE_SIZE);
+        let n = input.read_page(0, &mut buf).unwrap();
+        assert_eq!(n, PAGE_SIZE);
+        assert_eq!(&buf[..], data.as_slice());
+    }
+
+    #[test]
+    fn prefetch_range_spanning_page_boundary() {
+        // A range that straddles two pages should queue both pages.
+        let f = Fixture::new();
+        let page0 = vec![0xAAu8; PAGE_SIZE];
+        let page1 = vec![0xBBu8; PAGE_SIZE];
+        let mut data = page0.clone();
+        data.extend_from_slice(&page1);
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        // Straddle the boundary: last 64 bytes of page 0 + first 64 bytes of page 1.
+        let off = (PAGE_SIZE - 64) as u64;
+        input.prefetch(off, 128);
+
+        let mut buf = alloc_page(PAGE_SIZE);
+        let n0 = input.read_page(0, &mut buf).unwrap();
+        assert_eq!(n0, PAGE_SIZE);
+        assert_eq!(&buf[..], page0.as_slice());
+
+        let n1 = input.read_page(1, &mut buf).unwrap();
+        assert_eq!(n1, PAGE_SIZE);
+        assert_eq!(&buf[..], page1.as_slice());
+    }
+
+    #[test]
+    fn prefetch_sub_page_file_is_noop_at_eof() {
+        // File is smaller than one page; prefetch starting at the file's end should be a no-op.
+        let f = Fixture::new();
+        let data = vec![0x11u8; 512];
+        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
+        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
+
+        input.prefetch(512, 100); // off == file_len, page_range returns None
     }
 }
