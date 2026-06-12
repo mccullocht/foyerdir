@@ -31,8 +31,6 @@ final class FoyerDirectoryBindings {
     static final MethodHandle INDEX_OUTPUT_CLOSE;
     // foyer_directory_create_input(dir, relative_path, path_len) -> *FoyerIndexInput
     static final MethodHandle DIRECTORY_CREATE_INPUT;
-    // foyer_index_input_read_page(input, page_id, out, out_len) -> u32
-    static final MethodHandle INDEX_INPUT_READ_PAGE;
     // foyer_index_input_len(input) -> u64
     static final MethodHandle INDEX_INPUT_LEN;
     // foyer_index_input_read_chunks(input, offset, length) -> *const FoyerReadChunks
@@ -103,14 +101,6 @@ final class FoyerDirectoryBindings {
                     FunctionDescriptor.of(
                             ValueLayout.ADDRESS,
                             ValueLayout.ADDRESS,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_INT));
-            INDEX_INPUT_READ_PAGE = linker.downcallHandle(
-                    symbols.findOrThrow("foyer_index_input_read_page"),
-                    FunctionDescriptor.of(
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_LONG,
                             ValueLayout.ADDRESS,
                             ValueLayout.JAVA_INT));
             INDEX_INPUT_LEN = linker.downcallHandle(

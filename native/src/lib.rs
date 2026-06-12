@@ -191,55 +191,6 @@ impl FoyerIndexInput {
         })
     }
 
-    fn read_page(&self, page_id: usize, out: &mut [u8]) -> io::Result<usize> {
-        assert!(
-            page_id < self.pages,
-            "page_id {page_id} >= pages {}",
-            self.pages
-        );
-
-        let key = CacheKey {
-            file: self.file_id,
-            page: page_id,
-        };
-        let offset = (page_id * self.dir.page_size) as u64;
-        let len = out.len();
-        let file = Arc::clone(&self.file);
-
-        let dir = Arc::clone(&self.dir);
-        let entry = self
-            .dir
-            .runtime
-            .block_on(async move {
-                // get_or_fetch is called inside block_on so Handle::current() is valid.
-                dir.cache
-                    .get_or_fetch(&key, move || async move {
-                        // TODO: improve handling for the last page. Interior pages must read a whole block,
-                        // the last page must issue a whole block read but can't read everything.
-                        let (bytes_read, mut buf) = tokio::task::spawn_blocking(move || {
-                            use std::os::unix::fs::FileExt;
-                            let mut buf = alloc_page(len);
-                            let bytes_read = file.read_at(&mut buf, offset);
-                            (bytes_read, buf)
-                        })
-                        .await
-                        .expect("blocking task panicked");
-
-                        let bytes_read = bytes_read?;
-                        if bytes_read != len {
-                            buf.truncate(bytes_read);
-                        }
-                        Ok::<_, io::Error>(buf.into_boxed_slice())
-                    })
-                    .await
-            })
-            .map_err(io::Error::other)?;
-
-        let bytes: &[u8] = entry.value();
-        out[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
     /// pread starting at `off` into `out`, writing up to `out.len()` bytes.
     ///
     /// Returns the number of bytes actually read into the buffer.
@@ -248,7 +199,7 @@ impl FoyerIndexInput {
     /// read very small amounts of data (a byte to a few KB).
     /// requesting a few KB of data or less.
     fn read_at(&self, off: u64, out: &mut [u8]) -> foyer::Result<u64> {
-        let pinned_read = self.read_chunked(off, off + out.len() as u64)?;
+        let pinned_read = self.read_chunked(off, out.len() as u64)?;
         let mut out_next = 0usize;
         for s in pinned_read.page_iter() {
             let out_end = out_next + s.len();
@@ -638,20 +589,6 @@ mod ffi {
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn foyer_index_input_read_page(
-        input: *mut FoyerIndexInput,
-        page_id: u64,
-        out: *mut u8,
-        out_len: u32,
-    ) -> u32 {
-        let input = unsafe { &*input };
-        let out = unsafe { std::slice::from_raw_parts_mut(out, out_len as usize) };
-        input
-            .read_page(page_id as usize, out)
-            .expect("input read page does not propagate errors") as u32
-    }
-
-    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn foyer_index_input_read_at(
         input: *mut FoyerIndexInput,
         offset: u64,
@@ -925,96 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn read_page_reads_first_page() {
-        let f = Fixture::new();
-        let data: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 256) as u8).collect();
-        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
-        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
-
-        let mut buf = alloc_page(PAGE_SIZE);
-        let n = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n, PAGE_SIZE);
-        assert_eq!(&buf[..], data.as_slice());
-    }
-
-    #[test]
-    fn read_page_reads_second_page() {
-        let f = Fixture::new();
-        let page0 = vec![0xAAu8; PAGE_SIZE];
-        let page1 = vec![0xBBu8; PAGE_SIZE];
-        let mut data = page0.clone();
-        data.extend_from_slice(&page1);
-        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
-        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
-
-        let mut buf = alloc_page(PAGE_SIZE);
-        let n0 = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n0, PAGE_SIZE);
-        assert_eq!(&buf[..], page0.as_slice());
-
-        let n1 = input.read_page(1, &mut buf).unwrap();
-        assert_eq!(n1, PAGE_SIZE);
-        assert_eq!(&buf[..], page1.as_slice());
-    }
-
-    #[test]
-    fn read_page_last_partial_page() {
-        let f = Fixture::new();
-        let page0 = vec![0x11u8; PAGE_SIZE];
-        let tail = vec![0x22u8; 512];
-        let mut data = page0.clone();
-        data.extend_from_slice(&tail);
-        std::fs::write(f.dir.path().join("test.bin"), &data).unwrap();
-        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
-
-        let mut page0_buf = alloc_page(PAGE_SIZE);
-        let n0 = input.read_page(0, &mut page0_buf).unwrap();
-        assert_eq!(n0, PAGE_SIZE);
-        assert_eq!(&page0_buf[..], page0.as_slice());
-
-        let mut tail_buf = alloc_page(512);
-        let n1 = input.read_page(1, &mut tail_buf).unwrap();
-        assert_eq!(n1, 512);
-        assert_eq!(&tail_buf[..n1], tail.as_slice());
-    }
-
-    #[test]
-    fn read_page_populated_by_output() {
-        let f = Fixture::new();
-        let page0: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8).collect();
-        let page1 = vec![0x77u8; PAGE_SIZE];
-
-        // write_page inserts pages into the cache; close with len=0 trims to 2 full pages
-        let mut out = f.dir.new_output(Path::new("test.bin")).unwrap();
-        out.write_page(&page0).unwrap();
-        out.write_page(&page1).unwrap();
-        out.close(&vec![0u8; PAGE_SIZE], 0).unwrap();
-
-        // new_input reuses the same file_id, so reads hit the cache populated above
-        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
-
-        let mut buf = alloc_page(PAGE_SIZE);
-        let n0 = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n0, PAGE_SIZE);
-        assert_eq!(&buf[..], page0.as_slice());
-
-        let n1 = input.read_page(1, &mut buf).unwrap();
-        assert_eq!(n1, PAGE_SIZE);
-        assert_eq!(&buf[..], page1.as_slice());
-    }
-
-    #[test]
-    #[should_panic(expected = "page_id 1 >= pages 1")]
-    fn read_page_panics_out_of_bounds() {
-        let f = Fixture::new();
-        std::fs::write(f.dir.path().join("test.bin"), vec![0u8; PAGE_SIZE]).unwrap();
-        let input = f.dir.new_input(Path::new("test.bin")).unwrap();
-
-        let mut buf = alloc_page(PAGE_SIZE);
-        input.read_page(1, &mut buf).unwrap();
-    }
-
-    #[test]
     fn prefetch_zero_len_is_noop() {
         let f = Fixture::new();
         std::fs::write(f.dir.path().join("test.bin"), vec![0x42u8; PAGE_SIZE]).unwrap();
@@ -1048,8 +895,8 @@ mod tests {
         input.prefetch(0, PAGE_SIZE as u64);
 
         let mut buf = alloc_page(PAGE_SIZE);
-        let n = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n, PAGE_SIZE);
+        let n = input.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, PAGE_SIZE as u64);
         assert_eq!(&buf[..], data.as_slice());
     }
 
@@ -1064,8 +911,8 @@ mod tests {
 
         let mut buf = alloc_page(PAGE_SIZE);
         for page_id in 0..3 {
-            let n = input.read_page(page_id, &mut buf).unwrap();
-            assert_eq!(n, PAGE_SIZE);
+            let n = input.read_at((page_id * PAGE_SIZE) as u64, &mut buf).unwrap();
+            assert_eq!(n, PAGE_SIZE as u64);
             assert_eq!(
                 &buf[..],
                 &data[page_id * PAGE_SIZE..(page_id + 1) * PAGE_SIZE]
@@ -1083,13 +930,13 @@ mod tests {
         let input = f.dir.new_input(Path::new("test.bin")).unwrap();
 
         let mut buf = alloc_page(PAGE_SIZE);
-        input.read_page(0, &mut buf).unwrap();
+        input.read_at(0, &mut buf).unwrap();
 
         // Page is now in cache; prefetch should skip the spawn and be a no-op.
         input.prefetch(0, PAGE_SIZE as u64);
 
-        let n = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n, PAGE_SIZE);
+        let n = input.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, PAGE_SIZE as u64);
         assert_eq!(&buf[..], data.as_slice());
     }
 
@@ -1104,8 +951,8 @@ mod tests {
         input.prefetch(128, 512);
 
         let mut buf = alloc_page(PAGE_SIZE);
-        let n = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n, PAGE_SIZE);
+        let n = input.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, PAGE_SIZE as u64);
         assert_eq!(&buf[..], data.as_slice());
     }
 
@@ -1125,12 +972,12 @@ mod tests {
         input.prefetch(off, 128);
 
         let mut buf = alloc_page(PAGE_SIZE);
-        let n0 = input.read_page(0, &mut buf).unwrap();
-        assert_eq!(n0, PAGE_SIZE);
+        let n0 = input.read_at(0, &mut buf).unwrap();
+        assert_eq!(n0, PAGE_SIZE as u64);
         assert_eq!(&buf[..], page0.as_slice());
 
-        let n1 = input.read_page(1, &mut buf).unwrap();
-        assert_eq!(n1, PAGE_SIZE);
+        let n1 = input.read_at(PAGE_SIZE as u64, &mut buf).unwrap();
+        assert_eq!(n1, PAGE_SIZE as u64);
         assert_eq!(&buf[..], page1.as_slice());
     }
 
