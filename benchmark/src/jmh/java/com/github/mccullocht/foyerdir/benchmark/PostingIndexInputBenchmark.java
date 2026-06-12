@@ -11,6 +11,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.store.NIOFSDirectory;
 import org.apache.lucene.util.IOUtils;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -46,6 +47,9 @@ public class PostingIndexInputBenchmark {
   private IndexInput mmapIn;
   private PostingIndexInput mmapPostingIn;
 
+  private IndexInput niofsIn;
+  private PostingIndexInput niofsPostingIn;
+
   private FoyerDirectory foyerDir;
   private IndexInput foyerIn;
   private PostingIndexInput foyerPostingIn;
@@ -62,6 +66,16 @@ public class PostingIndexInputBenchmark {
     mmapIn = mmapDir.openInput("docs", IOContext.DEFAULT);
     mmapPostingIn = new PostingIndexInput(mmapIn, forUtil);
 
+    var niofsDir = NIOFSDirectory.open(Files.createTempDirectory("postingBench"));
+    try (IndexOutput out = niofsDir.createOutput("docs", IOContext.DEFAULT)) {
+      Random r = new Random(0);
+      for (int i = 0; i < 100; ++i) {
+        out.writeLong(r.nextLong());
+      }
+    }
+    niofsIn = niofsDir.openInput("docs", IOContext.DEFAULT);
+    niofsPostingIn = new PostingIndexInput(niofsIn, forUtil);
+
     foyerDir = new FoyerDirectory(Files.createTempDirectory("postingBench"), 64 << 20, 12);
     try (IndexOutput out = foyerDir.createOutput("docs", IOContext.DEFAULT)) {
       Random r = new Random(0);
@@ -76,6 +90,7 @@ public class PostingIndexInputBenchmark {
   @TearDown(Level.Trial)
   public void tearDown() throws Exception {
     IOUtils.close(mmapIn);
+    IOUtils.close(niofsIn);
     IOUtils.close(foyerIn, foyerDir);
   }
 
@@ -94,6 +109,24 @@ public class PostingIndexInputBenchmark {
   public void mmapDecodeVector(Blackhole bh) throws IOException {
     mmapIn.seek(3);
     mmapPostingIn.decode(bpv, values);
+    bh.consume(values);
+  }
+
+  @Benchmark
+  public void niofsDecode(Blackhole bh) throws IOException {
+    niofsIn.seek(3);
+    niofsPostingIn.decode(bpv, values);
+    bh.consume(values);
+  }
+
+  @Benchmark
+  @Fork(
+      value = 3,
+      jvmArgsPrepend = {"--add-modules=jdk.incubator.vector"},
+      jvmArgsAppend = {"-Xmx1g", "-Xms1g", "-XX:+AlwaysPreTouch"})
+  public void niofsDecodeVector(Blackhole bh) throws IOException {
+    niofsIn.seek(3);
+    niofsPostingIn.decode(bpv, values);
     bh.consume(values);
   }
 
