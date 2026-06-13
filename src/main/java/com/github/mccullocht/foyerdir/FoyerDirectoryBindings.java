@@ -31,10 +31,12 @@ final class FoyerDirectoryBindings {
     static final MethodHandle INDEX_OUTPUT_CLOSE;
     // foyer_directory_create_input(dir, relative_path, path_len) -> *FoyerIndexInput
     static final MethodHandle DIRECTORY_CREATE_INPUT;
-    // foyer_index_input_read_page(input, page_id, out, out_len) -> u32
-    static final MethodHandle INDEX_INPUT_READ_PAGE;
     // foyer_index_input_len(input) -> u64
     static final MethodHandle INDEX_INPUT_LEN;
+    // foyer_index_input_read_chunks(input, offset, length) -> *const FoyerReadChunks
+    static final MethodHandle INDEX_INPUT_READ_CHUNKS;
+    // foyer_read_chunks_drop(read_chunks)
+    static final MethodHandle INDEX_INPUT_READ_CHUNKS_DROP;
     // foyer_index_input_prefetch(input, offset, length)
     static final MethodHandle INDEX_INPUT_PREFETCH;
     // foyer_index_input_close(input)
@@ -101,19 +103,21 @@ final class FoyerDirectoryBindings {
                             ValueLayout.ADDRESS,
                             ValueLayout.ADDRESS,
                             ValueLayout.JAVA_INT));
-            INDEX_INPUT_READ_PAGE = linker.downcallHandle(
-                    symbols.findOrThrow("foyer_index_input_read_page"),
-                    FunctionDescriptor.of(
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_LONG,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_INT));
             INDEX_INPUT_LEN = linker.downcallHandle(
                     symbols.findOrThrow("foyer_index_input_len"),
                     FunctionDescriptor.of(
                             ValueLayout.JAVA_LONG,
                             ValueLayout.ADDRESS));
+            INDEX_INPUT_READ_CHUNKS = linker.downcallHandle(
+                    symbols.findOrThrow("foyer_index_input_read_chunks"),
+                    FunctionDescriptor.of(
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
+            INDEX_INPUT_READ_CHUNKS_DROP = linker.downcallHandle(
+                    symbols.findOrThrow("foyer_read_chunks_drop"),
+                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
             INDEX_INPUT_PREFETCH = linker.downcallHandle(
                     symbols.findOrThrow("foyer_index_input_prefetch"),
                     FunctionDescriptor.ofVoid(

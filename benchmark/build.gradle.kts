@@ -26,4 +26,11 @@ jmh {
     if (project.hasProperty("profiler")) {
         profilers.add(project.property("profiler") as String)
     }
+    if (project.hasProperty("params")) {
+        val entries = (project.property("params") as String).split(",")
+        for (entry in entries) {
+            val (k, v) = entry.split("=", limit = 2)
+            benchmarkParameters.put(k.trim(), project.objects.listProperty(String::class.java).value(listOf(v.trim())))
+        }
+    }
 }

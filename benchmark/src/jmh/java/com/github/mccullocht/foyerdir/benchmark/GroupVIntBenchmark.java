@@ -74,6 +74,7 @@ public class GroupVIntBenchmark {
   IndexInput mmapGVIntIn;
   IndexInput mmapVIntIn;
   IndexInput nioGVIntIn;
+  IndexInput nioVIntIn;
   IndexInput foyerGVIntIn;
   IndexInput foyerVIntIn;
 
@@ -84,10 +85,16 @@ public class GroupVIntBenchmark {
 
   void initNioInput(int[] docs) throws Exception {
     Directory dir = new NIOFSDirectory(Files.createTempDirectory("groupvintdata"));
-    IndexOutput out = dir.createOutput("gvint", IOContext.DEFAULT);
-    out.writeGroupVInts(docs, docs.length);
-    out.close();
+    IndexOutput vintOut = dir.createOutput("vint", IOContext.DEFAULT);
+    IndexOutput gvintOut = dir.createOutput("gvint", IOContext.DEFAULT);
+    gvintOut.writeGroupVInts(docs, docs.length);
+    for (long v : docs) {
+      vintOut.writeVInt((int) v);
+    }
+    vintOut.close();
+    gvintOut.close();
     nioGVIntIn = dir.openInput("gvint", IOContext.DEFAULT);
+    nioVIntIn = dir.openInput("vint", IOContext.DEFAULT);
   }
 
   void initMMapInput(int[] docs) throws Exception {
@@ -157,6 +164,15 @@ public class GroupVIntBenchmark {
   public void benchMMapDirectoryInputs_readGroupVInt(Blackhole bh) throws IOException {
     mmapGVIntIn.seek(0);
     GroupVIntUtil.readGroupVInts(mmapGVIntIn, values, size);
+    bh.consume(values);
+  }
+
+  @Benchmark
+  public void benchNIOFSDirectoryInputs_readVInt(Blackhole bh) throws IOException {
+    nioVIntIn.seek(0);
+    for (int i = 0; i < size; i++) {
+      values[i] = nioVIntIn.readVInt();
+    }
     bh.consume(values);
   }
 
